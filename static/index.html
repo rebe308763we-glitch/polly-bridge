@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Polly Remote — KissToy Compatible</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0d0d1a;
+            color: #e0e0e0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 16px;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+        }
+        .container {
+            background: #13132b;
+            border-radius: 24px;
+            padding: 28px 24px;
+            max-width: 400px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.03);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .header h1 {
+            font-size: 1.4em;
+            color: #ff6b8a;
+            letter-spacing: 1px;
+        }
+        .header .info {
+            font-size: 0.7em;
+            color: #555;
+            margin-top: 4px;
+        }
+
+        /* Status badge */
+        .status-row {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 24px;
+        }
+        .status-badge {
+            flex: 1;
+            text-align: center;
+            padding: 6px 0;
+            border-radius: 20px;
+            font-size: 0.75em;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        .badge-relay { background: #1a1a3a; }
+        .badge-relay.on { background: #0a2e1a; color: #4ecca3; }
+        .badge-relay.off { background: #2e0a0a; color: #ff6b8a; }
+        .badge-ctrl { background: #1a1a3a; color: #888; }
+        .badge-ctrl.on { background: #0a1a2e; color: #4ea9cc; }
+
+        /* Motor sliders */
+        .motor-card {
+            background: #1a1a35;
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 16px;
+            border: 1px solid #252545;
+        }
+        .motor-label {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .motor-label .name { font-weight: 600; font-size: 1em; }
+        .motor-label .value {
+            background: #ff6b8a;
+            color: #fff;
+            padding: 4px 14px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 0.9em;
+            min-width: 48px;
+            text-align: center;
+        }
+        .motor-label .range { font-size: 0.7em; color: #666; margin-top: 2px; }
+
+        /* Custom range slider */
+        input[type="range"] {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 10px;
+            border-radius: 5px;
+            outline: none;
+            margin: 6px 0;
+        }
+        #slider1 {
+            background: linear-gradient(to right, #1a1a35, #ff6b8a);
+        }
+        #slider1::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 36px; height: 36px;
+            border-radius: 50%;
+            background: #ff6b8a;
+            cursor: pointer;
+            box-shadow: 0 0 20px rgba(255,107,138,0.4);
+            border: 2px solid #fff;
+        }
+        #slider3 {
+            background: linear-gradient(to right, #1a1a35, #9b59b6);
+        }
+        #slider3::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 36px; height: 36px;
+            border-radius: 50%;
+            background: #9b59b6;
+            cursor: pointer;
+            box-shadow: 0 0 20px rgba(155,89,182,0.4);
+            border: 2px solid #fff;
+        }
+
+        /* Quick buttons */
+        .quick-row {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+            flex-wrap: wrap;
+        }
+        .quick-btn {
+            flex: 1;
+            min-width: 60px;
+            padding: 10px 0;
+            border: 1px solid #333;
+            border-radius: 12px;
+            background: #1a1a35;
+            color: #ccc;
+            font-size: 0.8em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+            text-align: center;
+        }
+        .quick-btn:active { transform: scale(0.95); }
+        .quick-btn.vibe { border-color: #ff6b8a44; }
+        .quick-btn.vibe:active { background: #ff6b8a33; }
+        .quick-btn.suck { border-color: #9b59b644; }
+        .quick-btn.suck:active { background: #9b59b633; }
+
+        .btn-stop {
+            width: 100%;
+            padding: 14px;
+            margin-top: 16px;
+            border: none;
+            border-radius: 14px;
+            font-size: 1em;
+            font-weight: bold;
+            cursor: pointer;
+            background: #ff6b8a;
+            color: #fff;
+            letter-spacing: 2px;
+            transition: all 0.15s;
+        }
+        .btn-stop:active { transform: scale(0.97); background: #e05575; }
+
+        /* Config */
+        .config {
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px solid #1a1a35;
+        }
+        .config input {
+            width: 100%;
+            padding: 10px 12px;
+            margin-top: 4px;
+            border-radius: 10px;
+            border: 1px solid #252545;
+            background: #0d0d1a;
+            color: #ccc;
+            font-size: 0.8em;
+        }
+        .config label { font-size: 0.7em; color: #555; }
+
+        .log-area {
+            margin-top: 12px;
+            max-height: 80px;
+            overflow-y: auto;
+            font-size: 0.65em;
+            color: #444;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔌 Polly Remote</h1>
+            <div class="info">KissToy Protocol · WebSocket Relay</div>
+        </div>
+
+        <div class="status-row">
+            <div class="status-badge badge-relay off" id="badgeRelay">🔌 Relay Offline</div>
+            <div class="status-badge badge-ctrl" id="badgeCtrl">📡 Connecting...</div>
+        </div>
+
+        <!-- Motor 1: Vibration -->
+        <div class="motor-card">
+            <div class="motor-label">
+                <div>
+                    <div class="name">🫧 Motor 1 · 震动 (入体端)</div>
+                </div>
+                <div class="value" id="val1">0</div>
+            </div>
+            <input type="range" id="slider1" min="0" max="15" value="0" disabled>
+            <div class="quick-row">
+                <button class="quick-btn vibe" data-motor="1" data-val="3">弱 (3)</button>
+                <button class="quick-btn vibe" data-motor="1" data-val="7">中 (7)</button>
+                <button class="quick-btn vibe" data-motor="1" data-val="11">强 (11)</button>
+                <button class="quick-btn vibe" data-motor="1" data-val="15">MAX (15)</button>
+            </div>
+        </div>
+
+        <!-- Motor 3: Suction -->
+        <div class="motor-card">
+            <div class="motor-label">
+                <div>
+                    <div class="name">💨 Motor 3 · 吮吸</div>
+                </div>
+                <div class="value" id="val3" style="background:#9b59b6;">0</div>
+            </div>
+            <input type="range" id="slider3" min="0" max="10" value="0" disabled>
+            <div class="quick-row">
+                <button class="quick-btn suck" data-motor="3" data-val="2">弱 (2)</button>
+                <button class="quick-btn suck" data-motor="3" data-val="5">中 (5)</button>
+                <button class="quick-btn suck" data-motor="3" data-val="8">强 (8)</button>
+                <button class="quick-btn suck" data-motor="3" data-val="10">MAX (10)</button>
+            </div>
+        </div>
+
+        <button class="btn-stop" id="btnStop">⏹ STOP ALL</button>
+
+        <div class="config">
+            <label>Server</label>
+            <input type="text" id="serverUrl" value="wss://polly-bridge.onrender.com" placeholder="wss://polly-bridge.onrender.com">
+            <label style="margin-top:6px;">Group Hash</label>
+            <input type="text" id="groupId" value="82e0ff7c8e3dabe932332e6ea65d272d" placeholder="group hash from share link">
+            <label style="margin-top:6px;">Device ID</label>
+            <input type="text" id="deviceId" value="33" placeholder="device_id">
+        </div>
+
+        <div class="log-area" id="log"></div>
+    </div>
+
+    <script>
+        const $ = id => document.getElementById(id);
+        let ws = null;
+        let pingTimer = null;
+        let currentMotors = {};
+
+        function log(msg) {
+            const el = $('log');
+            const t = new Date().toLocaleTimeString();
+            el.innerHTML = `[${t}] ${msg}<br>` + el.innerHTML;
+            if (el.children.length > 20) el.removeChild(el.lastChild);
+        }
+
+        function setStatus(key, text, on) {
+            const el = $('badge' + key);
+            el.textContent = text;
+            el.className = `status-badge badge-${key.toLowerCase()} ${on ? 'on' : 'off'}`;
+        }
+
+        function sendCommand(motors) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('⚠ Not connected!');
+                return;
+            }
+            if (JSON.stringify(motors) === JSON.stringify(currentMotors)) return;
+            currentMotors = {...motors};
+
+            const msg = {
+                event: "control",
+                data: {
+                    target: $('groupId').value,
+                    device_id: $('deviceId').value,
+                    motors: motors,
+                }
+            };
+            ws.send(JSON.stringify(msg));
+            log(`→ M1=${motors['1']??0} M3=${motors['3']??0}`);
+        }
+
+        // ── Motor sliders ──────────────────────────────────────
+        function setupSlider(sliderId, valId, motorId) {
+            const slider = $(sliderId);
+            let timeout = null;
+
+            slider.addEventListener('input', () => {
+                const val = parseInt(slider.value);
+                $(valId).textContent = val;
+                clearTimeout(timeout);
+                // Throttle: send immediately, but only last value within 80ms
+                timeout = setTimeout(() => {
+                    const motors = { ...currentMotors };
+                    motors[motorId] = val;
+                    // Don't send zero for both unless explicit stop
+                    if (val > 0 || Object.values(motors).some(v => v > 0)) {
+                        sendCommand(motors);
+                    }
+                }, 80);
+            });
+
+            // Send on release (immediate)
+            slider.addEventListener('change', () => {
+                clearTimeout(timeout);
+                const val = parseInt(slider.value);
+                const motors = { ...currentMotors };
+                motors[motorId] = val;
+                sendCommand(motors);
+            });
+        }
+
+        setupSlider('slider1', 'val1', '1');
+        setupSlider('slider3', 'val3', '3');
+
+        // ── Quick buttons ──────────────────────────────────────
+        document.querySelectorAll('.quick-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const motor = btn.dataset.motor;
+                const val = parseInt(btn.dataset.val);
+                const slider = $(`slider${motor}`);
+                slider.value = val;
+                $(`val${motor}`).textContent = val;
+                const motors = { ...currentMotors };
+                motors[motor] = val;
+                sendCommand(motors);
+            });
+        });
+
+        // ── Stop button ────────────────────────────────────────
+        $('btnStop').addEventListener('click', () => {
+            ['1', '3'].forEach(m => {
+                const slider = $(`slider${m}`);
+                slider.value = 0;
+                $(`val${m}`).textContent = '0';
+            });
+            sendCommand({'1': 0, '3': 0});
+            currentMotors = {};
+            log('⏹ STOP');
+        });
+
+        // ── WebSocket ──────────────────────────────────────────
+        function connect() {
+            if (ws) { ws.close(); }
+            if (pingTimer) { clearInterval(pingTimer); }
+
+            const server = $('serverUrl').value;
+            const group = $('groupId').value;
+
+            if (!server || !group) {
+                log('⚠ Server URL and Group are required');
+                return;
+            }
+
+            const wsUrl = `${server}/websocket-kisstoy?group=${encodeURIComponent(group)}`;
+            log(`Connecting to ${server}...`);
+            setStatus('Ctrl', '📡 Connecting...', false);
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                log('✓ Connected');
+                setStatus('Ctrl', '📡 Connected', true);
+
+                // Ping every 10 seconds (KissToy protocol)
+                pingTimer = setInterval(() => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send('ping');
+                    }
+                }, 10000);
+            };
+
+            ws.onmessage = (e) => {
+                if (e.data === 'pong') return; // heartbeat response
+
+                try {
+                    const msg = JSON.parse(e.data);
+                    const event = msg.event;
+                    const data = msg.data || {};
+
+                    if (event === 'device_online') {
+                        setStatus('Relay', '🔌 Relay Online', true);
+                        log('✓ Device relay online');
+                    } else if (event === 'device_offline') {
+                        setStatus('Relay', '🔌 Relay Offline', false);
+                        log('✗ Device relay offline');
+                    } else if (event === 'ack') {
+                        // command acknowledged
+                    } else if (event === 'status') {
+                        if (data.online) {
+                            setStatus('Relay', '🔌 Relay Online', true);
+                        }
+                    } else {
+                        log(`← ${event}`);
+                    }
+                } catch (err) {
+                    // not JSON, might be raw pong
+                }
+            };
+
+            ws.onclose = (e) => {
+                log(`Disconnected (code=${e.code}). Reconnecting in 5s...`);
+                setStatus('Ctrl', '📡 Disconnected', false);
+                setStatus('Relay', '🔌 Relay Offline', false);
+                if (pingTimer) clearInterval(pingTimer);
+                ws = null;
+                $('slider1').disabled = true;
+                $('slider3').disabled = true;
+                setTimeout(connect, 5000);
+            };
+
+            ws.onerror = () => {
+                log('⚠ Connection error');
+            };
+
+            $('slider1').disabled = false;
+            $('slider3').disabled = false;
+        }
+
+        // ── Init ────────────────────────────────────────────────
+        $('serverUrl').addEventListener('change', connect);
+        $('groupId').addEventListener('change', connect);
+        connect();
+    </script>
+</body>
+</html>

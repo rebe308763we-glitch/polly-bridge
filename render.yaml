@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: polly-bridge
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: POLLY_SECRET
+        generateValue: true
+      - key: RELAY_SECRET
+        generateValue: true
+      - key: PORT
+        value: "8000"
+    autoDeploy: true
