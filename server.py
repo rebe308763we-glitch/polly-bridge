@@ -45,6 +45,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 
 # ── State ───────────────────────────────────────────────────────────
 group_upstreams: dict[str, websockets.WebSocketClientProtocol] = {}
+group_relays: dict[str, WebSocket] = {}  # local_relay.py connections
 group_clients: dict[str, set[WebSocket]] = {}
 rate_buckets: dict[str, list[float]] = {}
 
@@ -227,17 +228,36 @@ async def ws_browser(websocket: WebSocket, group: str = Query(...),
                     continue
                 motors = msg.get("data", {}).get("motors", {})
                 log.info(f"[→] motors={motors}")
-                try:
-                    await upstream.send(raw)
-                    await websocket.send_text(json.dumps({
-                        "event": "ack", "data": {"motors": motors, "relayed": True},
-                    }))
-                except Exception as e:
-                    group_upstreams.pop(group, None)
-                    await websocket.send_text(json.dumps({
-                        "event": "ack", "data": {"motors": motors, "relayed": False,
-                                                  "message": str(e)},
-                    }))
+
+                # Prefer local relay (China IP) over direct upstream (Render US IP)
+                relay = group_relays.get(group)
+                forwarded = False
+                error_msg = ""
+
+                if relay:
+                    try:
+                        await relay.send_text(raw)
+                        forwarded = True
+                        log.info(f"[→] via relay")
+                    except Exception as e:
+                        group_relays.pop(group, None)
+                        error_msg = f"relay error: {e}"
+
+                if not forwarded:
+                    # Fall back to direct upstream
+                    try:
+                        await upstream.send(raw)
+                        forwarded = True
+                        log.info(f"[→] via upstream")
+                    except Exception as e:
+                        group_upstreams.pop(group, None)
+                        error_msg = f"upstream error: {e}"
+
+                await websocket.send_text(json.dumps({
+                    "event": "ack",
+                    "data": {"motors": motors, "relayed": forwarded,
+                              "message": error_msg if not forwarded else "ok"},
+                }))
     except WebSocketDisconnect:
         log.info(f"[Browser] Disconnected: group={group[:12]}...")
     finally:
@@ -249,6 +269,48 @@ async def ws_browser(websocket: WebSocket, group: str = Query(...),
             await task
         except asyncio.CancelledError:
             pass
+
+
+# ── Relay WebSocket (local_relay.py) ───────────────────────────────
+@app.websocket("/ws/relay")
+async def ws_relay(websocket: WebSocket, group: str = Query(...)):
+    """local_relay.py connects here. Forwards browser commands to relay."""
+    await websocket.accept()
+    group_relays[group] = websocket
+    log.info(f"[Relay] Connected: group={group[:12]}...")
+
+    # Notify browsers
+    for client in group_clients.get(group, set()):
+        try:
+            await client.send_text(json.dumps({
+                "event": "relay_online", "data": {"group": group},
+            }))
+        except Exception:
+            pass
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            if raw.strip() == "ping":
+                await websocket.send_text("pong")
+                continue
+            # Forward relay responses to browsers
+            for client in list(group_clients.get(group, set())):
+                try:
+                    await client.send_text(raw)
+                except Exception:
+                    group_clients[group].discard(client)
+    except WebSocketDisconnect:
+        log.info(f"[Relay] Disconnected: group={group[:12]}...")
+    finally:
+        group_relays.pop(group, None)
+        for client in group_clients.get(group, set()):
+            try:
+                await client.send_text(json.dumps({
+                    "event": "relay_offline", "data": {"group": group},
+                }))
+            except Exception:
+                pass
 
 
 # ── Keepalive ───────────────────────────────────────────────────────

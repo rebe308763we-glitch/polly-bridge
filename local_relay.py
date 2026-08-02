@@ -1,19 +1,16 @@
 """
 local_relay — bridges polly-bridge ↔ KissToy WebSocket
 ========================================================
-Runs on your local machine (in China, where KissToy WS is reachable).
-
-Connects to:
+Runs on YOUR local machine. Connects to:
   1. polly-bridge /ws/relay  — receives browser commands
-  2. KissToy WebSocket       — forwards to real server
+  2. KissToy WebSocket       — forwards with correct Origin/IP
 
-Chain:
-  Browser → polly-bridge (Render) → local_relay.py (your PC) → KissToy → phone → BLE
+Why: KissToy server ignores commands from non-China IPs (e.g. Render US).
+Your local machine (China IP) can relay successfully.
 
 Usage:
-  python local_relay.py [session_id]
-
-  session_id = the "id" value from the KissToy share link (e.g. 756801)
+  python local_relay.py <session_id>
+  e.g.: python local_relay.py 756801
 """
 
 import asyncio
@@ -21,6 +18,7 @@ import json
 import logging
 import sys
 import time
+import urllib.request
 
 import websockets
 
@@ -29,7 +27,25 @@ log = logging.getLogger("local-relay")
 
 POLLY_BRIDGE = "wss://polly-bridge.onrender.com"
 KISSTOY_WS = "wss://api.app.knightjenay.cn/websocket-kisstoy"
+KISSTOY_API = "https://api.app.knightjenay.cn"
 GROUP = "82e0ff7c8e3dabe932332e6ea65d272d"
+
+
+def call_binding(user_id: str):
+    """Register this session before sending commands."""
+    try:
+        url = f"{KISSTOY_API}/kisstoy/remote-control/binding"
+        body = json.dumps({"id": user_id}).encode()
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            log.info(f"[Binding] user_id={user_id} → {result}")
+            return result
+    except Exception as e:
+        log.error(f"[Binding] Failed: {e}")
+        return None
 
 
 async def main():
@@ -37,12 +53,15 @@ async def main():
 
     print("=" * 55)
     print("  polly-bridge Local Relay")
-    print(f"  Group:  {GROUP[:16]}...")
-    print(f"  Session: {session_id}")
-    print(f"  Bridge:  {POLLY_BRIDGE}")
-    print(f"  KissToy: {KISSTOY_WS}")
+    print(f"  Group:     {GROUP[:16]}...")
+    print(f"  Session:   {session_id}")
+    print(f"  Bridge:    {POLLY_BRIDGE}")
+    print(f"  KissToy:   {KISSTOY_WS}?group=...")
     print("  Chain: Browser → polly-bridge → YOU → KissToy → phone → BLE")
     print("=" * 55)
+
+    # 0. Call binding first
+    call_binding(session_id)
 
     while True:
         polly_ws = None
@@ -54,8 +73,8 @@ async def main():
             polly_ws = await websockets.connect(polly_url, ping_interval=None)
             log.info("✓ Connected to polly-bridge relay")
 
-            # 2. Connect to KissToy WebSocket
-            kisstoy_url = f"{KISSTOY_WS}?group={GROUP}&id={session_id}"
+            # 2. Connect to KissToy (URL: just ?group=, no id param)
+            kisstoy_url = f"{KISSTOY_WS}?group={GROUP}"
             kisstoy_ws = await websockets.connect(
                 kisstoy_url,
                 ping_interval=None,
@@ -65,9 +84,9 @@ async def main():
                 },
                 open_timeout=15,
             )
-            log.info(f"✓ Connected to KissToy")
+            log.info(f"✓ Connected to KissToy ({kisstoy_ws.remote_address})")
 
-            # ── Forwarding ──────────────────────────────────────
+            # ── Bidirectional relay ────────────────────────────
 
             async def polly_to_kisstoy():
                 """Browser commands → KissToy"""
@@ -88,15 +107,15 @@ async def main():
                         log.error(f"[→] Send error: {e}")
 
             async def kisstoy_to_polly():
-                """KissToy responses → browser (via polly)"""
+                """KissToy responses → browser"""
                 async for raw in kisstoy_ws:
                     if raw.strip() == "ping":
                         await kisstoy_ws.send("pong")
                         continue
                     try:
                         await polly_ws.send(raw)
-                    except Exception as e:
-                        log.error(f"[←] Send error: {e}")
+                    except Exception:
+                        pass
 
             async def heartbeat():
                 while True:
