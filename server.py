@@ -112,6 +112,53 @@ class SessionInit(BaseModel):
     lang: str = "zh"
 
 
+@app.get("/api/test-upstream")
+async def test_upstream(group: str = Query(...), user_id: str = Query(default="")):
+    """Diagnostic: test full upstream chain."""
+    result = {"group": group, "user_id": user_id}
+
+    # 1. Binding
+    if user_id:
+        binding = call_binding(user_id)
+        result["binding"] = binding
+
+    # 2. WebSocket connection
+    try:
+        ws = await get_or_create_upstream(group, user_id)
+        result["ws_connected"] = True
+        result["ws_remote"] = str(ws.remote_address) if hasattr(ws, 'remote_address') else "?"
+    except Exception as e:
+        result["ws_connected"] = False
+        result["ws_error"] = str(e)
+        return result
+
+    # 3. Check online status
+    try:
+        await ws.send(json.dumps({"event": "online_status", "data": {"group": group}}))
+        import asyncio as _asyncio
+        resp = await _asyncio.wait_for(ws.recv(), timeout=5)
+        result["online_response"] = json.loads(resp)
+    except Exception as e:
+        result["online_error"] = str(e)
+
+    # 4. Send a test command
+    try:
+        test_cmd = json.dumps({
+            "event": "control",
+            "data": {
+                "target": group,
+                "device_id": "33",
+                "motors": {"1": 10}
+            }
+        })
+        await ws.send(test_cmd)
+        result["test_command_sent"] = True
+    except Exception as e:
+        result["test_command_error"] = str(e)
+
+    return result
+
+
 @app.post("/api/session/init")
 async def init_session(s: SessionInit, request: Request):
     host = request.headers.get("host", "localhost")
