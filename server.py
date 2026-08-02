@@ -80,9 +80,17 @@ async def get_or_create_upstream(group: str) -> websockets.WebSocketClientProtoc
         ws_url = f"{KISSTOY_WS}?group={group}"
         log.info(f"[Upstream] Connecting to KissToy: {ws_url[:80]}...")
         try:
-            ws = await websockets.connect(ws_url, ping_interval=None)
+            ws = await websockets.connect(
+                ws_url,
+                ping_interval=None,
+                extra_headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Origin": "https://api.app.knightjenay.cn",
+                },
+                open_timeout=15,
+            )
             group_upstreams[group] = ws
-            log.info(f"[Upstream] ✓ Connected for group {group[:12]}...")
+            log.info(f"[Upstream] ✓ Connected for group {group[:12]}... ({ws.remote_address})")
         except Exception as e:
             log.error(f"[Upstream] Connection failed: {e}")
             raise
@@ -95,10 +103,11 @@ async def forward_to_upstream(group: str, message: str):
     try:
         ws = await get_or_create_upstream(group)
         await ws.send(message)
+        return True
     except Exception as e:
         log.error(f"[Forward ↑] Error: {e}")
-        # Clean up dead upstream
         group_upstreams.pop(group, None)
+        return False
 
 
 # ── Models ──────────────────────────────────────────────────────────
@@ -248,7 +257,15 @@ async def ws_relay(websocket: WebSocket, group: str = Query(...)):
                 log.info(f"[Relay →] group={group[:12]}... motors={motors}")
 
                 # Forward to KissToy upstream
-                await forward_to_upstream(group, raw)
+                ok = await forward_to_upstream(group, raw)
+                await websocket.send_text(json.dumps({
+                    "event": "ack",
+                    "data": {
+                        "motors": motors,
+                        "relayed": ok,
+                        "message": "forwarded to KissToy" if ok else "upstream unavailable",
+                    },
+                }))
 
             elif event == "ping":
                 await websocket.send_text(json.dumps({"event": "pong"}))
