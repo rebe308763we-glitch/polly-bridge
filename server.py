@@ -80,7 +80,13 @@ def call_binding(user_id: str):
 async def get_or_create_upstream(group: str, user_id: str = ""):
     """Create upstream to KissToy WebSocket. URL: ?group=GROUP only (no id)."""
     ws = group_upstreams.get(group)
-    if ws is None or ws.closed:
+    needs_new = ws is None
+    if not needs_new:
+        try:
+            await asyncio.wait_for(ws.ping(), timeout=3)
+        except Exception:
+            needs_new = True
+    if needs_new:
         # Call binding first if user_id provided
         if user_id:
             call_binding(user_id)
