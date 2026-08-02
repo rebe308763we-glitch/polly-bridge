@@ -4,14 +4,14 @@ polly-bridge Relay Client (KissToy Protocol)
 Runs on the local machine. Connects to polly-bridge via WSS and
 forwards motor commands to Intiface Central (Buttplug.io) over BLE.
 
-Motor mapping (KissToy → Buttplug):
-  Motor 1: vibration (入体端), range 0-15 → intensity 0.0-1.0
-  Motor 3: suction (吮吸), range 0-10 → oscillate intensity 0.0-1.0
+Uses buttplug-py 0.2.0 (actual API).
 
-Supports multiple devices — maps motors to available Buttplug devices.
+Motor mapping (KissToy → Buttplug):
+  Motor 1: vibration (入体端), range 0-15 → ScalarCmd actuator_type="Vibrate"
+  Motor 3: suction (吮吸), range 0-10 → ScalarCmd actuator_type="Oscillate"
 
 Usage:
-  pip install -r relay_requirements.txt
+  pip install websockets buttplug-py
   python relay_client.py \
     --server wss://polly-bridge.onrender.com \
     --group 82e0ff7c8e3dabe932332e6ea65d272d \
@@ -24,18 +24,19 @@ import logging
 import argparse
 import sys
 import time
-import math
 from typing import Optional
 
 import websockets
+from buttplug import Client, WebsocketConnector
+from buttplug.messages.v3 import Scalar, ScalarCmd, StopDeviceCmd
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("relay-client")
 
 # Motor value ranges (from KissToy protocol)
-MOTOR_RANGES = {
-    "1": 15,   # vibration
-    "3": 10,   # suction
+MOTOR_CONFIG = {
+    "1": {"max": 15, "actuator_type": "Vibrate",  "label": "震动 (Vibrate)"},
+    "3": {"max": 10, "actuator_type": "Oscillate", "label": "吮吸 (Suction/Oscillate)"},
 }
 
 
@@ -46,31 +47,25 @@ class RelayClient:
         group: str,
         token: str,
         intiface_url: str = "ws://127.0.0.1:12345",
-        device_mapping: Optional[dict] = None,
+        motor_device_map: Optional[dict] = None,
     ):
         self.server_url = server_url.rstrip("/")
         self.group = group
         self.token = token
         self.intiface_url = intiface_url
-        self.client = None  # Buttplug client
+        self.client: Optional[Client] = None
         self.devices: list = []
-        # Custom motor → device mapping: {"1": 0, "3": 1} (motor_id → device_index)
-        self.motor_device_map = device_mapping or {}
+        # motor_id -> {"device_index": int, "actuator_index": int}
+        self.motor_map: dict[str, dict] = {}
+        # custom override
+        self.custom_mapping = motor_device_map or {}
 
     async def connect_intiface(self):
         """Connect to Intiface Central via Buttplug.io."""
-        try:
-            from buttplug import Client, WebsocketConnector
-            connector = WebsocketConnector(self.intiface_url)
-            self.client = Client("polly-relay", connector)
-            await self.client.connect()
-            log.info(f"✓ Connected to Intiface at {self.intiface_url}")
-        except ImportError:
-            log.error("buttplug-py not installed. Run: pip install buttplug-py")
-            raise
-        except Exception as e:
-            log.error(f"Intiface connection failed: {e}")
-            raise
+        connector = WebsocketConnector(self.intiface_url)
+        self.client = Client("polly-relay", connector)
+        await self.client.connect()
+        log.info(f"✓ Connected to Intiface at {self.intiface_url}")
 
     async def scan_devices(self):
         """Discover BLE devices via Intiface."""
@@ -81,113 +76,116 @@ class RelayClient:
 
         self.devices = list(self.client.devices)
         if not self.devices:
-            log.warning("⚠ No devices found. Make sure:")
-            log.warning("  1. Intiface Central is in Engine mode (port 12345)")
-            log.warning("  2. Device is powered on and in range")
+            log.warning("⚠ No devices found.")
             return []
 
         log.info(f"Found {len(self.devices)} device(s):")
         for i, d in enumerate(self.devices):
-            caps = []
-            if d.vibrate_attributes:
-                caps.append(f"vibrate({len(d.vibrate_attributes)} motor(s))")
-            if hasattr(d, 'oscillate_attributes') and d.oscillate_attributes:
-                caps.append(f"oscillate({len(d.oscillate_attributes)})")
-            if hasattr(d, 'rotate_attributes') and d.rotate_attributes:
-                caps.append(f"rotate({len(d.rotate_attributes)})")
-            log.info(f"  [{i}] {d.name} — {', '.join(caps) if caps else 'basic'}")
+            acts = []
+            for a in d.actuators:
+                acts.append(f"{a.actuator_type}(idx={a.index})")
+            log.info(f"  [{i}] {d.name} — actuators: {', '.join(acts) if acts else 'none'}")
 
-        # Auto-map: if motor_device_map is empty, set defaults
-        if not self.motor_device_map:
-            if len(self.devices) >= 1:
-                self.motor_device_map["1"] = 0  # first device = motor 1 (vibrate)
-            if len(self.devices) >= 2:
-                self.motor_device_map["3"] = 1  # second device = motor 3 (suction)
-            elif len(self.devices) == 1:
-                self.motor_device_map["3"] = 0  # same device for both motors
-
-        log.info(f"Motor→Device mapping: {self.motor_device_map}")
+        # Auto-map motors to device actuators
+        self._auto_map_motors()
         return self.devices
 
-    async def send_motor_command(self, motors: dict):
-        """
-        Execute motor commands via Buttplug.
+    def _auto_map_motors(self):
+        """Map KissToy motor IDs to Buttplug device/actuator indices."""
+        self.motor_map = {}
 
-        motors: {"1": 15, "3": 5} — raw KissToy values
-        """
+        for motor_id, cfg in MOTOR_CONFIG.items():
+            desired_type = cfg["actuator_type"]
+            custom = self.custom_mapping.get(motor_id)
+
+            if custom is not None and custom < len(self.devices):
+                dev = self.devices[custom]
+                # Find actuator of matching type on this device
+                for act in dev.actuators:
+                    if act.actuator_type == desired_type or act.actuator_type in ("Vibrate", "Oscillate", "Rotate"):
+                        self.motor_map[motor_id] = {"device_index": custom, "actuator_index": act.index}
+                        log.info(f"  M{motor_id} ({cfg['label']}) → device[{custom}] {dev.name}.{act.actuator_type}[{act.index}]")
+                        break
+                else:
+                    if dev.actuators:
+                        act = dev.actuators[0]
+                        self.motor_map[motor_id] = {"device_index": custom, "actuator_index": act.index}
+                        log.info(f"  M{motor_id} ({cfg['label']}) → device[{custom}] {dev.name}.{act.actuator_type}[{act.index}] (fallback)")
+            else:
+                # Auto: search all devices for matching actuator type
+                for di, dev in enumerate(self.devices):
+                    for act in dev.actuators:
+                        if desired_type in act.actuator_type or act.actuator_type in ("Vibrate", "Oscillate", "Rotate"):
+                            if motor_id not in self.motor_map:
+                                self.motor_map[motor_id] = {"device_index": di, "actuator_index": act.index}
+                                log.info(f"  M{motor_id} ({cfg['label']}) → device[{di}] {dev.name}.{act.actuator_type}[{act.index}]")
+                                break
+
+        # If still no mapping, fallback to first actuator of first device
+        if not self.motor_map and self.devices:
+            dev = self.devices[0]
+            if dev.actuators:
+                for motor_id in MOTOR_CONFIG:
+                    if motor_id not in self.motor_map:
+                        self.motor_map[motor_id] = {"device_index": 0, "actuator_index": dev.actuators[0].index}
+                log.info(f"  All motors → device[0] {dev.name} (fallback)")
+
+    async def send_motor_command(self, motors: dict):
+        """Execute motor commands via Buttplug ScalarCmd."""
         if not self.client or not self.devices:
             log.warning("No device connected")
             return
 
-        action_log = []
-
         for motor_id, raw_value in motors.items():
-            max_val = MOTOR_RANGES.get(motor_id, 15)
-            intensity = max(0.0, min(1.0, int(raw_value) / max_val))
-            device_idx = self.motor_device_map.get(motor_id)
-
-            if device_idx is None or device_idx >= len(self.devices):
-                log.warning(f"Motor {motor_id}: no device mapped")
+            mapping = self.motor_map.get(motor_id)
+            if not mapping:
                 continue
 
-            device = self.devices[device_idx]
+            cfg = MOTOR_CONFIG.get(motor_id, {"max": 15, "actuator_type": "Vibrate"})
+            intensity = max(0.0, min(1.0, int(raw_value) / cfg["max"]))
 
             try:
-                if motor_id == "1":
-                    # Vibration motor (入体端)
-                    await device.vibrate(intensity)
-                    action_log.append(f"M1(vibrate)={intensity:.2f}")
-
-                elif motor_id == "3":
-                    # Suction motor (吮吸)
-                    # Try oscillate first (closest to suction), fall back to vibrate
-                    if hasattr(device, 'oscillate') and device.oscillate_attributes:
-                        await device.oscillate(intensity)
-                        action_log.append(f"M3(suction/osc)={intensity:.2f}")
-                    else:
-                        # Suction mapped to vibrate if oscillate not available
-                        await device.vibrate(intensity * 0.7)  # slightly gentler
-                        action_log.append(f"M3(suction→vibe)={intensity:.2f}")
-
-                else:
-                    # Unknown motor — default to vibrate
-                    await device.vibrate(intensity)
-                    action_log.append(f"M{motor_id}(vibe)={intensity:.2f}")
-
+                cmd = ScalarCmd(
+                    device_index=mapping["device_index"],
+                    scalars=[Scalar(
+                        index=mapping["actuator_index"],
+                        scalar=intensity,
+                        actuator_type=cfg["actuator_type"],
+                    )],
+                )
+                await self.client.send(cmd)
+                log.info(f"  M{motor_id}: {intensity:.2f} ({raw_value}/{cfg['max']})")
             except Exception as e:
-                log.error(f"Motor {motor_id} command failed: {e}")
-
-        if action_log:
-            log.info(f"  Motors: {', '.join(action_log)}")
+                log.error(f"  M{motor_id} failed: {e}")
 
     async def stop_all(self):
-        """Stop all motors on all devices."""
+        """Stop all motors."""
         if not self.client:
             return
-        for device in self.devices:
-            try:
-                await device.stop()
-            except Exception:
-                pass
-        log.info("  All motors stopped")
+        try:
+            await self.client.stop_all()
+            log.info("  All motors stopped")
+        except Exception as e:
+            log.error(f"Stop failed: {e}")
 
     async def run(self):
         """Main loop."""
         ws_url = f"{self.server_url}/ws/relay?group={self.group}&token={self.token}"
-        log.info(f"polly-bridge Relay Client")
-        log.info(f"  Server: {self.server_url}")
-        log.info(f"  Group:  {self.group[:16]}...")
-        log.info(f"  Motor ranges: M1=0-15 (vibrate), M3=0-10 (suction)")
+        log.info("=" * 50)
+        log.info("polly-bridge Relay Client")
+        log.info(f"  Server:  {self.server_url}")
+        log.info(f"  Group:   {self.group[:16]}...")
+        log.info(f"  Intiface: {self.intiface_url}")
+        log.info("=" * 50)
 
         # Connect to Intiface
-        intiface_ok = False
-        while not intiface_ok:
+        while True:
             try:
                 await self.connect_intiface()
                 await self.scan_devices()
-                intiface_ok = True
-            except Exception:
-                log.warning("Intiface not available. Retrying in 5s...")
+                break
+            except Exception as e:
+                log.warning(f"Intiface not available ({e}). Retrying in 5s...")
                 await asyncio.sleep(5)
 
         # Connect to polly-bridge
@@ -195,24 +193,18 @@ class RelayClient:
             try:
                 async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
                     log.info("✓ Connected to polly-bridge server")
-                    current_motors = {}
 
-                    # Send device info to server
+                    # Send device info
                     device_list = []
                     for i, d in enumerate(self.devices):
-                        caps = []
-                        if d.vibrate_attributes:
-                            caps.append("vibrate")
-                        if hasattr(d, 'oscillate_attributes') and d.oscillate_attributes:
-                            caps.append("oscillate")
-                        device_list.append({"index": i, "name": d.name, "capabilities": caps})
+                        acts = [{"index": a.index, "type": a.actuator_type} for a in d.actuators]
+                        device_list.append({"index": i, "name": d.name, "actuators": acts})
 
                     await ws.send(json.dumps({
                         "type": "device_info",
                         "group": self.group,
                         "devices": device_list,
-                        "motor_map": self.motor_device_map,
-                        "motor_ranges": MOTOR_RANGES,
+                        "motor_map": {m: {"device_index": v["device_index"], "actuator_index": v["actuator_index"]} for m, v in self.motor_map.items()},
                         "timestamp": time.time(),
                     }))
 
@@ -230,25 +222,23 @@ class RelayClient:
                         elif msg_type == "command":
                             motors = msg.get("motors", {})
                             if motors:
-                                current_motors = motors
                                 await self.send_motor_command(motors)
 
                             # Send status back
                             await ws.send(json.dumps({
                                 "type": "status",
                                 "group": self.group,
-                                "motors": current_motors,
+                                "motors": motors,
                                 "online": True,
                                 "timestamp": time.time(),
                             }))
 
                         elif msg_type == "controller_online":
-                            log.info("  Browser controller connected — ready for commands")
+                            log.info("  🌐 Browser controller connected")
 
                         elif msg_type == "controller_offline":
-                            log.info("  Browser controller disconnected — stopping motors")
+                            log.info("  🌐 Browser controller disconnected — stopping")
                             await self.stop_all()
-                            current_motors = {}
 
             except websockets.ConnectionClosed:
                 log.warning("Server connection lost. Reconnecting in 5s...")
@@ -265,14 +255,14 @@ def main():
         epilog="""
 Examples:
   python relay_client.py --server wss://polly-bridge.onrender.com --group abc123 --token secret
-  python relay_client.py --server ws://localhost:8000 --group test --token dev --intiface ws://localhost:12345
+  python relay_client.py --server ws://localhost:8000 --group test --token dev
         """,
     )
     parser.add_argument("--server", required=True, help="polly-bridge server URL (wss://...)")
     parser.add_argument("--group", required=True, help="Group hash (from KissToy share link)")
     parser.add_argument("--token", required=True, help="RELAY_SECRET from Render env vars")
     parser.add_argument("--intiface", default="ws://127.0.0.1:12345", help="Intiface WebSocket URL")
-    parser.add_argument("--motor-map", default=None, help="Motor→Device mapping JSON, e.g. '{\"1\":0,\"3\":1}'")
+    parser.add_argument("--motor-map", default=None, help='Motor→Device mapping JSON, e.g. \'{"1":0,"3":0}\'')
     args = parser.parse_args()
 
     device_mapping = None
@@ -284,14 +274,13 @@ Examples:
         group=args.group,
         token=args.token,
         intiface_url=args.intiface,
-        device_mapping=device_mapping,
+        motor_device_map=device_mapping,
     )
 
     try:
         asyncio.run(client.run())
     except KeyboardInterrupt:
         log.info("Shutting down...")
-        # Try to stop all motors on exit
         asyncio.run(client.stop_all())
         sys.exit(0)
 
