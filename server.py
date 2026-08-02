@@ -1,52 +1,50 @@
 """
-polly-bridge — KissToy Protocol Compatible Bridge Server
-=========================================================
-Replicates the KnightJenay/KissToy WebSocket API exactly, then relays
-commands to a local machine running Intiface Central via Buttplug.io.
+polly-bridge — KissToy WebSocket Relay
+=======================================
+Acts as a transparent WebSocket relay between controllers and the real
+KissToy/KnightJenay WebSocket server.
 
-Protocol (reverse-engineered from api.app.knightjenay.cn):
-  WebSocket: wss://<host>/websocket-kisstoy?group=<group_hash>
-  Command:   {"event":"control","data":{"target":"<group>","device_id":"33","motors":{"1":15}}}
-  Heartbeat: client sends "ping", server replies "pong" (every 10s)
-  Motors:    1 = vibrate (0-15), 3 = suction (0-10)
+Actual chain:
+  Browser/Claude → polly-bridge (Render) → KissToy WS server → phone app → BLE → device
 
-Architecture:
-  Browser (KissToy-compatible)
-      ↓ WSS /websocket-kisstoy?group=...
-  polly-bridge (Render)
-      ↓ WSS /ws/relay?group=...&token=...
-  Relay Client (local PC + Intiface Central)
-      ↓ BLE
-  Device
+polly-bridge:
+  1. Accepts browser connections at /websocket-kisstoy?group=...
+  2. Relays to the real KissToy server: api.app.knightjenay.cn
+  3. Forwards ping/pong and all control messages bidirectionally
+
+KissToy protocol:
+  Connect:  wss://api.app.knightjenay.cn/websocket-kisstoy?group=<hash>
+  Command:  {"event":"control","data":{"target":"<group>","device_id":"33","motors":{"1":15}}}
+  Heartbeat: "ping" ↔ "pong" every 10s
+  Motors:   1 = vibrate (0-15), 3 = suction (0-10)
 """
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import os
-import secrets
 import time
-from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Query
+import websockets
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import uvicorn
 
 # ── Config ──────────────────────────────────────────────────────────
-RELAY_SECRET = os.environ.get("RELAY_SECRET", secrets.token_hex(32))
 PORT = int(os.environ.get("PORT", "8000"))
+KISSTOY_WS = os.environ.get("KISSTOY_WS", "wss://api.app.knightjenay.cn/websocket-kisstoy")
+RATE_MAX = 120
+RATE_WINDOW = 60
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("polly-bridge")
 
 # ── App ─────────────────────────────────────────────────────────────
-app = FastAPI(title="polly-bridge", version="0.2.0")
+app = FastAPI(title="polly-bridge", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,16 +54,12 @@ app.add_middleware(
 )
 
 # ── State ───────────────────────────────────────────────────────────
-# group_id -> set of browser WebSockets
-group_controllers: dict[str, set[WebSocket]] = {}
-# group_id -> set of relay WebSockets
-group_relays: dict[str, set[WebSocket]] = {}
-# session_id -> metadata
-sessions: dict[str, dict] = {}
-# Rate limiting
+# group_id -> KissToy upstream WebSocket connection
+group_upstreams: dict[str, websockets.WebSocketClientProtocol] = {}
+# group_id -> set of browser downstream WebSockets
+group_clients: dict[str, set[WebSocket]] = {}
+# Rate limiting: key -> timestamps
 rate_buckets: dict[str, list[float]] = {}
-RATE_MAX = 120  # commands per window
-RATE_WINDOW = 60  # seconds
 
 
 def check_rate(key: str) -> bool:
@@ -78,9 +72,33 @@ def check_rate(key: str) -> bool:
     return True
 
 
-def sign(payload: dict) -> str:
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hmac.new(RELAY_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+async def get_or_create_upstream(group: str) -> websockets.WebSocketClientProtocol:
+    """Get existing upstream connection for a group, or create a new one."""
+    ws = group_upstreams.get(group)
+
+    if ws is None or ws.closed:
+        ws_url = f"{KISSTOY_WS}?group={group}"
+        log.info(f"[Upstream] Connecting to KissToy: {ws_url[:80]}...")
+        try:
+            ws = await websockets.connect(ws_url, ping_interval=None)
+            group_upstreams[group] = ws
+            log.info(f"[Upstream] ✓ Connected for group {group[:12]}...")
+        except Exception as e:
+            log.error(f"[Upstream] Connection failed: {e}")
+            raise
+
+    return ws
+
+
+async def forward_to_upstream(group: str, message: str):
+    """Send a message to the KissToy upstream server."""
+    try:
+        ws = await get_or_create_upstream(group)
+        await ws.send(message)
+    except Exception as e:
+        log.error(f"[Forward ↑] Error: {e}")
+        # Clean up dead upstream
+        group_upstreams.pop(group, None)
 
 
 # ── Models ──────────────────────────────────────────────────────────
@@ -91,22 +109,16 @@ class SessionInit(BaseModel):
     lang: str = "zh"
 
 
-class DeviceCommand(BaseModel):
-    device_id: str
-    group: str
-    motors: dict[str, int] = Field(default_factory=dict)
-    action: Optional[str] = None
-    intensity: Optional[float] = None
-
-
 # ── REST API ────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {
         "service": "polly-bridge",
-        "version": "0.2.0",
-        "protocol": "KissToy-compatible",
-        "ws_endpoint": "/websocket-kisstoy?group=<group_hash>",
+        "version": "0.3.0",
+        "mode": "KissToy WebSocket relay",
+        "upstream": KISSTOY_WS,
+        "active_groups": len(group_upstreams),
+        "connected_clients": sum(len(c) for c in group_clients.values()),
     }
 
 
@@ -114,22 +126,21 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "groups": len(group_controllers),
-        "relays": sum(len(r) for r in group_relays.values()),
-        "controllers": sum(len(c) for c in group_controllers.values()),
+        "groups": len(group_upstreams),
+        "clients": sum(len(c) for c in group_clients.values()),
     }
 
 
 @app.post("/api/session/init")
 async def init_session(session: SessionInit, request: Request):
-    """Initialize a control session — returns WebSocket URL in KissToy format."""
-    group = session.group or secrets.token_hex(16)
+    """Create a control session, returns KissToy-compatible WebSocket URL."""
+    group = session.group or "default"
     host = request.headers.get("host", "localhost")
-
     return {
         "ws_url": f"wss://{host}/websocket-kisstoy?group={group}",
         "group": group,
         "device_id": session.device_id,
+        "upstream": KISSTOY_WS,
         "motors": {
             "1": {"name": "震动 (Vibrate)", "range": [0, 15]},
             "3": {"name": "吮吸 (Suction)", "range": [0, 10]},
@@ -137,256 +148,131 @@ async def init_session(session: SessionInit, request: Request):
     }
 
 
-@app.get("/api/groups/{group}/devices")
-async def group_devices(group: str):
-    """List devices in a group."""
-    relay_count = len(group_relays.get(group, set()))
-    controller_count = len(group_controllers.get(group, set()))
-    return {
-        "group": group,
-        "relays_connected": relay_count,
-        "controllers_connected": controller_count,
-        "online": relay_count > 0,
-    }
-
-
-# ── KissToy-Compatible WebSocket ────────────────────────────────────
+# ── Main WebSocket Relay ────────────────────────────────────────────
 @app.websocket("/websocket-kisstoy")
-async def ws_kisstoy(websocket: WebSocket, group: str = Query(...)):
+async def ws_relay(websocket: WebSocket, group: str = Query(...)):
     """
-    Main control WebSocket — compatible with KissToy/KnightJenay protocol.
+    Browser-facing WebSocket. Relays all messages to/from the real
+    KissToy server at api.app.knightjenay.cn.
 
-    Browser connects:  wss://host/websocket-kisstoy?group=<group_hash>
-    Sends:             {"event":"control","data":{"target":"<group>","device_id":"33","motors":{"1":15}}}
-    Heartbeat:         client sends "ping" → server replies "pong"
+    Browser → polly-bridge → KissToy server → phone app → BLE → device
     """
     await websocket.accept()
-    group_controllers.setdefault(group, set()).add(websocket)
-    client_ip = websocket.client.host if websocket.client else "unknown"
-    log.info(f"[KissToy] Browser connected: group={group[:12]}... from {client_ip}")
+    group_clients.setdefault(group, set()).add(websocket)
+    client_ip = websocket.client.host if websocket.client else "?"
+    log.info(f"[Client] Browser connected: group={group[:12]}... from {client_ip}")
 
-    # Notify relays that a controller joined
-    for relay in group_relays.get(group, set()):
+    # Ensure upstream is connected
+    try:
+        await get_or_create_upstream(group)
+    except Exception:
+        await websocket.send_text(json.dumps({
+            "event": "error",
+            "data": {"message": "Cannot reach KissToy upstream server"},
+        }))
+        group_clients.get(group, set()).discard(websocket)
+        await websocket.close()
+        return
+
+    # Start upstream reader task for this group
+    upstream = group_upstreams.get(group)
+    upstream_messages: asyncio.Queue = asyncio.Queue()
+
+    async def read_from_upstream():
+        """Read messages from KissToy server, forward to all browsers in group."""
         try:
-            await relay.send_json({
-                "type": "controller_online",
-                "group": group,
-                "timestamp": time.time(),
-            })
-        except Exception:
-            pass
+            async for raw in upstream:
+                for client in list(group_clients.get(group, set())):
+                    try:
+                        await client.send_text(raw)
+                    except Exception:
+                        group_clients.get(group, set()).discard(client)
+        except websockets.ConnectionClosed:
+            log.info(f"[Upstream] KissToy connection closed for group {group[:12]}...")
+            group_upstreams.pop(group, None)
+        except Exception as e:
+            log.error(f"[Upstream] Reader error: {e}")
+            group_upstreams.pop(group, None)
 
-    last_ping = time.time()
+    upstream_task = asyncio.create_task(read_from_upstream())
+
     try:
         while True:
             raw = await websocket.receive_text()
 
-            # Heartbeat: ping/pong
+            # Heartbeat handling — local response to ping
             if raw.strip() == "ping":
                 await websocket.send_text("pong")
-                last_ping = time.time()
                 continue
 
-            # Parse JSON command
+            # Try to forward command to upstream
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                await websocket.send_text(json.dumps({"event": "error", "data": {"message": "Invalid JSON"}}))
+                await websocket.send_text(json.dumps({
+                    "event": "error", "data": {"message": "Invalid JSON"}
+                }))
                 continue
 
             event = msg.get("event", "")
-            data = msg.get("data", {})
 
             if event == "control":
-                target = data.get("target", group)
-                device_id = data.get("device_id", "")
-                motors = data.get("motors", {})
-
-                # Rate limit
-                rate_key = f"{group}:{client_ip}"
-                if not check_rate(rate_key):
+                if not check_rate(f"{group}:{client_ip}"):
                     await websocket.send_text(json.dumps({
                         "event": "error",
                         "data": {"message": "Rate limit exceeded"},
                     }))
                     continue
 
-                log.info(f"[KissToy] Control: group={group[:12]}... device={device_id} motors={motors}")
+                motors = msg.get("data", {}).get("motors", {})
+                log.info(f"[Relay →] group={group[:12]}... motors={motors}")
 
-                # Forward to relays in this group
-                payload = {
-                    "type": "command",
-                    "group": target,
-                    "device_id": device_id,
-                    "motors": motors,
-                    "timestamp": time.time(),
-                    "signature": "",
-                }
-                payload["signature"] = sign(payload)
-
-                forwarded = False
-                for relay in list(group_relays.get(target, set())):
-                    try:
-                        await relay.send_json(payload)
-                        forwarded = True
-                    except Exception:
-                        group_relays[target].discard(relay)
-
-                # Ack to browser
-                await websocket.send_text(json.dumps({
-                    "event": "ack",
-                    "data": {
-                        "device_id": device_id,
-                        "motors": motors,
-                        "relayed": forwarded,
-                    },
-                }))
+                # Forward to KissToy upstream
+                await forward_to_upstream(group, raw)
 
             elif event == "ping":
                 await websocket.send_text(json.dumps({"event": "pong"}))
 
             else:
-                log.debug(f"[KissToy] Unknown event: {event}")
+                # Forward unknown events too
+                await forward_to_upstream(group, raw)
 
     except WebSocketDisconnect:
-        log.info(f"[KissToy] Browser disconnected: group={group[:12]}...")
-        group_controllers.get(group, set()).discard(websocket)
-        if not group_controllers.get(group):
-            group_controllers.pop(group, None)
-
-        # Notify relays
-        for relay in group_relays.get(group, set()):
-            try:
-                await relay.send_json({
-                    "type": "controller_offline",
-                    "group": group,
-                    "timestamp": time.time(),
-                })
-            except Exception:
-                pass
+        log.info(f"[Client] Browser disconnected: group={group[:12]}...")
     except Exception as e:
-        log.error(f"[KissToy] WS error: {e}")
-        group_controllers.get(group, set()).discard(websocket)
+        log.error(f"[Client] Error: {e}")
+    finally:
+        group_clients.get(group, set()).discard(websocket)
+        if not group_clients.get(group):
+            group_clients.pop(group, None)
 
-
-# ── Relay WebSocket (for local Intiface client) ─────────────────────
-@app.websocket("/ws/relay")
-async def ws_relay(websocket: WebSocket, group: str = Query(...), token: str = Query(...)):
-    """
-    Relay client connection. Talks Buttplug.io to the actual device.
-
-    Local machine connects:  wss://host/ws/relay?group=<hash>&token=<secret>
-    Receives:                {"type":"command","group":"...","motors":{"1":15}}
-    Sends back:              {"type":"status","motors":{...},"battery":...}
-    """
-    if token != RELAY_SECRET:
-        await websocket.close(code=4001, reason="Invalid token")
-        return
-
-    await websocket.accept()
-    group_relays.setdefault(group, set()).add(websocket)
-    log.info(f"[Relay] Connected: group={group[:12]}...")
-
-    # Notify browser controllers
-    for ctrl in group_controllers.get(group, set()):
+        # Cancel upstream reader
+        upstream_task.cancel()
         try:
-            await ctrl.send_text(json.dumps({
-                "event": "device_online",
-                "data": {"group": group},
-            }))
-        except Exception:
+            await upstream_task
+        except asyncio.CancelledError:
             pass
 
-    missed_pings = 0
-    try:
-        while True:
-            try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
-            except asyncio.TimeoutError:
-                missed_pings += 1
-                if missed_pings >= 3:
-                    log.warning(f"[Relay] Group {group[:12]}... heartbeat timeout")
-                    break
-                try:
-                    await websocket.send_json({"type": "ping", "timestamp": time.time()})
-                except Exception:
-                    break
-                continue
 
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            msg_type = msg.get("type", "")
-
-            if msg_type == "pong":
-                missed_pings = 0
-
-            elif msg_type == "status":
-                # Forward status to browser controllers
-                for ctrl in group_controllers.get(group, set()):
-                    try:
-                        await ctrl.send_text(json.dumps({
-                            "event": "status",
-                            "data": msg,
-                        }))
-                    except Exception:
-                        group_controllers.get(group, set()).discard(ctrl)
-
-            elif msg_type == "device_info":
-                # Device capabilities broadcast
-                for ctrl in group_controllers.get(group, set()):
-                    try:
-                        await ctrl.send_text(json.dumps({
-                            "event": "device_info",
-                            "data": msg,
-                        }))
-                    except Exception:
-                        pass
-
-    except WebSocketDisconnect:
-        log.info(f"[Relay] Disconnected: group={group[:12]}...")
-    except Exception as e:
-        log.error(f"[Relay] Error: {e}")
-    finally:
-        group_relays.get(group, set()).discard(websocket)
-        if not group_relays.get(group):
-            group_relays.pop(group, None)
-
-        # Notify browsers
-        for ctrl in group_controllers.get(group, set()):
-            try:
-                await ctrl.send_text(json.dumps({
-                    "event": "device_offline",
-                    "data": {"group": group},
-                }))
-            except Exception:
-                pass
-
-
-# ── Heartbeat Monitor ───────────────────────────────────────────────
+# ── Upstream Keepalive ──────────────────────────────────────────────
 @app.on_event("startup")
-async def start_monitor():
-    asyncio.create_task(heartbeat_monitor())
+async def start_keepalive():
+    asyncio.create_task(keepalive_monitor())
 
 
-async def heartbeat_monitor():
-    """Clean up stale relay connections."""
+async def keepalive_monitor():
+    """Send ping to KissToy upstream every 10s to keep connection alive."""
     while True:
         await asyncio.sleep(10)
-        for group, relays in list(group_relays.items()):
-            for relay in list(relays):
-                try:
-                    await relay.send_json({"type": "ping", "timestamp": time.time()})
-                except Exception:
-                    relays.discard(relay)
-                    log.info(f"[Monitor] Removed stale relay for group={group[:12]}...")
-            if not relays:
-                group_relays.pop(group, None)
+        for group, ws in list(group_upstreams.items()):
+            try:
+                await ws.send("ping")
+            except Exception:
+                log.info(f"[Keepalive] Removing dead upstream for group {group[:12]}...")
+                group_upstreams.pop(group, None)
 
 
-# ── Static Files ────────────────────────────────────────────────────
+# ── Static ──────────────────────────────────────────────────────────
 import os as _os
 _static_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "static")
 if _os.path.isdir(_static_dir):
@@ -403,5 +289,10 @@ async def remote_control():
 
 # ── Entrypoint ──────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info(f"Starting polly-bridge v0.2.0 on port {PORT}")
+    log.info("=" * 50)
+    log.info("polly-bridge v0.3.0 — KissToy WebSocket Relay")
+    log.info(f"  Upstream: {KISSTOY_WS}")
+    log.info(f"  Port:     {PORT}")
+    log.info("  Chain: Browser → polly-bridge → KissToy → phone → BLE → device")
+    log.info("=" * 50)
     uvicorn.run(app, host="0.0.0.0", port=PORT)
