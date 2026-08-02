@@ -262,6 +262,15 @@
         let pingTimer = null;
         let currentMotors = {};
 
+        // Auto-fill from URL params: ?group=...&id=...&device_id=...
+        (function() {
+            const p = new URLSearchParams(window.location.search);
+            if (p.get('group')) $('groupId').value = p.get('group');
+            if (p.get('id')) $('sessionId').value = p.get('id');
+            if (p.get('device_id')) $('deviceId').value = p.get('device_id');
+            if (p.get('server')) $('serverUrl').value = p.get('server');
+        })();
+
         function log(msg) {
             const el = $('log');
             const t = new Date().toLocaleTimeString();
