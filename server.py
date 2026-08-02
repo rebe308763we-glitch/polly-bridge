@@ -72,13 +72,16 @@ def check_rate(key: str) -> bool:
     return True
 
 
-async def get_or_create_upstream(group: str) -> websockets.WebSocketClientProtocol:
-    """Get existing upstream connection for a group, or create a new one."""
-    ws = group_upstreams.get(group)
+async def get_or_create_upstream(group: str, session_id: str = "") -> websockets.WebSocketClientProtocol:
+    """Get existing upstream connection for a group+session, or create a new one."""
+    upstream_key = f"{group}:{session_id}" if session_id else group
+    ws = group_upstreams.get(upstream_key)
 
     if ws is None or ws.closed:
         ws_url = f"{KISSTOY_WS}?group={group}"
-        log.info(f"[Upstream] Connecting to KissToy: {ws_url[:80]}...")
+        if session_id:
+            ws_url += f"&id={session_id}"
+        log.info(f"[Upstream] Connecting to KissToy: {ws_url[:100]}...")
         try:
             ws = await websockets.connect(
                 ws_url,
@@ -89,8 +92,8 @@ async def get_or_create_upstream(group: str) -> websockets.WebSocketClientProtoc
                 },
                 open_timeout=15,
             )
-            group_upstreams[group] = ws
-            log.info(f"[Upstream] ✓ Connected for group {group[:12]}... ({ws.remote_address})")
+            group_upstreams[upstream_key] = ws
+            log.info(f"[Upstream] ✓ Connected for {upstream_key[:30]}... ({ws.remote_address})")
         except Exception as e:
             log.error(f"[Upstream] Connection failed: {e}")
             raise
@@ -98,15 +101,16 @@ async def get_or_create_upstream(group: str) -> websockets.WebSocketClientProtoc
     return ws
 
 
-async def forward_to_upstream(group: str, message: str):
+async def forward_to_upstream(group: str, message: str, session_id: str = ""):
     """Send a message to the KissToy upstream server."""
     try:
-        ws = await get_or_create_upstream(group)
+        ws = await get_or_create_upstream(group, session_id)
         await ws.send(message)
         return True
     except Exception as e:
         log.error(f"[Forward ↑] Error: {e}")
-        group_upstreams.pop(group, None)
+        upstream_key = f"{group}:{session_id}" if session_id else group
+        group_upstreams.pop(upstream_key, None)
         return False
 
 
@@ -179,21 +183,24 @@ async def init_session(session: SessionInit, request: Request):
 
 # ── Main WebSocket Relay ────────────────────────────────────────────
 @app.websocket("/websocket-kisstoy")
-async def ws_relay(websocket: WebSocket, group: str = Query(...)):
+async def ws_relay(websocket: WebSocket, group: str = Query(...), id: str = Query(default="", alias="id")):
     """
     Browser-facing WebSocket. Relays all messages to/from the real
     KissToy server at api.app.knightjenay.cn.
 
+    Passes group + id (session) through to upstream.
     Browser → polly-bridge → KissToy server → phone app → BLE → device
     """
     await websocket.accept()
     group_clients.setdefault(group, set()).add(websocket)
     client_ip = websocket.client.host if websocket.client else "?"
-    log.info(f"[Client] Browser connected: group={group[:12]}... from {client_ip}")
+    session_id = id or ""
+    upstream_key = f"{group}:{session_id}" if session_id else group
+    log.info(f"[Client] Browser connected: {upstream_key[:30]}... from {client_ip}")
 
     # Ensure upstream is connected
     try:
-        await get_or_create_upstream(group)
+        await get_or_create_upstream(group, session_id)
     except Exception:
         await websocket.send_text(json.dumps({
             "event": "error",
@@ -204,7 +211,7 @@ async def ws_relay(websocket: WebSocket, group: str = Query(...)):
         return
 
     # Start upstream reader task for this group
-    upstream = group_upstreams.get(group)
+    upstream = group_upstreams.get(upstream_key)
     upstream_messages: asyncio.Queue = asyncio.Queue()
 
     async def read_from_upstream():
@@ -257,7 +264,7 @@ async def ws_relay(websocket: WebSocket, group: str = Query(...)):
                 log.info(f"[Relay →] group={group[:12]}... motors={motors}")
 
                 # Forward to KissToy upstream
-                ok = await forward_to_upstream(group, raw)
+                ok = await forward_to_upstream(group, raw, session_id)
                 await websocket.send_text(json.dumps({
                     "event": "ack",
                     "data": {
@@ -272,7 +279,7 @@ async def ws_relay(websocket: WebSocket, group: str = Query(...)):
 
             else:
                 # Forward unknown events too
-                await forward_to_upstream(group, raw)
+                await forward_to_upstream(group, raw, session_id)
 
     except WebSocketDisconnect:
         log.info(f"[Client] Browser disconnected: group={group[:12]}...")
