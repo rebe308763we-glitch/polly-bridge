@@ -131,6 +131,26 @@ async def health():
     }
 
 
+@app.get("/debug")
+async def debug():
+    """Debug endpoint showing upstream connection states."""
+    upstreams = {}
+    for group, ws in group_upstreams.items():
+        upstreams[group[:12] + "..."] = {
+            "open": not ws.closed if hasattr(ws, 'closed') else "unknown",
+            "local": f"{ws.local_address}" if hasattr(ws, 'local_address') else "?",
+            "remote": f"{ws.remote_address}" if hasattr(ws, 'remote_address') else "?",
+        }
+    clients = {}
+    for group, cset in group_clients.items():
+        clients[group[:12] + "..."] = len(cset)
+    return {
+        "upstream_kisstoy": KISSTOY_WS,
+        "upstreams": upstreams,
+        "clients": clients,
+    }
+
+
 @app.post("/api/session/init")
 async def init_session(session: SessionInit, request: Request):
     """Create a control session, returns KissToy-compatible WebSocket URL."""
