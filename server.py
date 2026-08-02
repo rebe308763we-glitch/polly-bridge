@@ -91,7 +91,7 @@ async def get_or_create_upstream(group: str, user_id: str = ""):
         if user_id:
             call_binding(user_id)
 
-        ws_url = f"{KISSTOY_WS}?group={group}"
+        ws_url = f"{KISSTOY_WS}?group={group}&id={user_id}" if user_id else f"{KISSTOY_WS}?group={group}"
         log.info(f"[Upstream] Connecting: {ws_url}")
         ws = await websockets.connect(ws_url, ping_interval=None, open_timeout=15)
         group_upstreams[group] = ws
