@@ -603,12 +603,10 @@ async def mcp_authorize(
     scope: str = Query(default=""),
 ):
     """OAuth authorization endpoint — auto-approves for personal use."""
-    if client_id not in mcp_clients:
-        return HTMLResponse("<h1>Unknown client</h1>", status_code=400)
-
+    # Accept any client (no validation — personal server, Render loses in-memory state)
     code = _randhex(16)
     mcp_auth_codes[code] = {"client_id": client_id, "redirect_uri": redirect_uri}
-    log.info(f"[MCP-OAuth] Auth code issued for {client_id[:12]}...")
+    log.info(f"[MCP-OAuth] Auth code issued: {code[:12]}...")
 
     # Auto-redirect back with code
     sep = "&" if "?" in redirect_uri else "?"
