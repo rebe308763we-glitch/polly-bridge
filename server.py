@@ -590,7 +590,7 @@ async def oauth_resource_metadata(request: Request, path: str):
     """OAuth 2.0 Protected Resource Metadata (RFC 9728) — tells Claude Chat how to auth."""
     base = str(request.base_url).rstrip("/")
     return {
-        "resource": f"{base}/mcp/{path}",
+        "resource": f"{base}/{path}",
         "authorization_servers": [base],
         "bearer_methods_supported": ["header"],
         "scopes_supported": ["mcp"],
