@@ -784,7 +784,7 @@ async def mcp_sse(request: Request):
     sid = uuid.uuid4().hex[:12]
     q: asyncio.Queue = asyncio.Queue()
     mcp_sessions[sid] = q
-    client_info = mcp_tokens[token]
+    client_info = mcp_tokens.get(token, {"client_id": "anonymous"})
     log.info(f"[MCP-SSE] Client connected: {sid} (client={client_info['client_id'][:12]}...)")
 
     async def event_stream():
