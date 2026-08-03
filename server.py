@@ -450,8 +450,22 @@ async def start_keepalive():
     asyncio.create_task(keepalive())
 
 
-# ── MCP SSE (for Claude Chat mobile/desktop) ─────────────────────────
+# ── MCP SSE + OAuth (for Claude Chat mobile/desktop) ─────────────────
+import hashlib as _hashlib
+
+def _randhex(n: int) -> str:
+    return os.urandom(n).hex()
+
 mcp_sessions: dict[str, asyncio.Queue] = {}
+mcp_tokens: dict[str, dict] = {}       # token → {client_id, created_at}
+mcp_clients: dict[str, str] = {}       # client_id → client_name
+mcp_auth_codes: dict[str, dict] = {}   # code → {client_id, redirect_uri}
+
+MCP_CLIENT_ID = os.environ.get("MCP_CLIENT_ID", "polly-bridge-client")
+MCP_CLIENT_SECRET = os.environ.get("MCP_CLIENT_SECRET", _randhex(16))
+MCP_REDIRECT_URI = os.environ.get("MCP_REDIRECT_URI", "http://localhost:0/callback")
+
+log.info(f"[MCP-OAuth] client_id={MCP_CLIENT_ID}")
 
 MCP_TOOLS = [
     {
@@ -535,17 +549,124 @@ async def mcp_sse_event(sid: str, data: str):
         await q.put(data)
 
 
+# ── OAuth Endpoints ───────────────────────────────────────────────
+
+@app.post("/mcp/register")
+async def mcp_register(request: Request):
+    """Dynamic Client Registration — Claude Chat registers here."""
+    try:
+        body = await request.json()
+        client_name = body.get("client_name", "claude-chat")
+        redirect_uris = body.get("redirect_uris", ["http://localhost:0/callback"])
+    except Exception:
+        client_name = "claude-chat"
+        redirect_uris = ["http://localhost:0/callback"]
+
+    client_id = _hashlib.sha256(f"{client_name}:{_randhex(8)}".encode()).hexdigest()[:32]
+    mcp_clients[client_id] = client_name
+    log.info(f"[MCP-OAuth] Registered client: {client_id[:12]}... ({client_name})")
+    return {
+        "client_id": client_id,
+        "client_name": client_name,
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_method": "none",
+    }
+
+
+@app.get("/mcp/authorize")
+async def mcp_authorize(
+    client_id: str = Query(...),
+    redirect_uri: str = Query(...),
+    response_type: str = Query(default="code"),
+    state: str = Query(default=""),
+    scope: str = Query(default=""),
+):
+    """OAuth authorization endpoint — auto-approves for personal use."""
+    if client_id not in mcp_clients:
+        return HTMLResponse("<h1>Unknown client</h1>", status_code=400)
+
+    code = _randhex(16)
+    mcp_auth_codes[code] = {"client_id": client_id, "redirect_uri": redirect_uri}
+    log.info(f"[MCP-OAuth] Auth code issued for {client_id[:12]}...")
+
+    # Auto-redirect back with code
+    sep = "&" if "?" in redirect_uri else "?"
+    redirect_url = f"{redirect_uri}{sep}code={code}"
+    if state:
+        redirect_url += f"&state={state}"
+    from starlette.responses import RedirectResponse
+    return RedirectResponse(url=redirect_url, status_code=302)
+
+
+@app.post("/mcp/token")
+async def mcp_token(request: Request):
+    """Token endpoint — exchange auth code for access token."""
+    try:
+        body = await request.json()
+    except Exception:
+        try:
+            form = await request.form()
+            body = dict(form)
+        except Exception:
+            return {"error": "invalid_request"}
+
+    grant_type = body.get("grant_type", "")
+    code = body.get("code", "")
+
+    if grant_type == "authorization_code":
+        auth = mcp_auth_codes.pop(code, None)
+        if not auth:
+            return {"error": "invalid_grant", "error_description": "Invalid or expired code"}
+        token = _randhex(24)
+        mcp_tokens[token] = {"client_id": auth["client_id"], "created_at": time.time()}
+        log.info(f"[MCP-OAuth] Token issued for {auth['client_id'][:12]}...")
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": 86400,
+        }
+    elif grant_type == "refresh_token":
+        refresh = body.get("refresh_token", "")
+        old = mcp_tokens.pop(refresh, None)
+        if not old:
+            return {"error": "invalid_grant"}
+        token = _randhex(24)
+        mcp_tokens[token] = old
+        return {"access_token": token, "token_type": "bearer", "expires_in": 86400}
+
+    return {"error": "unsupported_grant_type"}
+
+
+# ── SSE (with OAuth) ─────────────────────────────────────────────
+
 @app.get("/mcp/sse")
 async def mcp_sse(request: Request):
-    """SSE endpoint for Claude Chat MCP connection."""
+    """SSE endpoint with OAuth Bearer token support."""
+    # Check for Bearer token
+    auth_header = request.headers.get("Authorization", "")
+    token = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+    # Also check query param (fallback)
+    if not token:
+        token = request.query_params.get("token", "")
+
+    if not token or token not in mcp_tokens:
+        # Return auth required
+        async def auth_stream():
+            yield f"event: auth\ndata: {{\"code\":\"UNAUTHORIZED\",\"message\":\"Authentication required. Use /mcp/register and /mcp/authorize to get a token.\"}}\n\n"
+        return StreamingResponse(auth_stream(), media_type="text/event-stream",
+                                  status_code=401)
+
     sid = uuid.uuid4().hex[:12]
     q: asyncio.Queue = asyncio.Queue()
     mcp_sessions[sid] = q
-    log.info(f"[MCP-SSE] Client connected: {sid}")
+    client_info = mcp_tokens[token]
+    log.info(f"[MCP-SSE] Client connected: {sid} (client={client_info['client_id'][:12]}...)")
 
     async def event_stream():
         try:
-            # Send endpoint URL for this session
             yield f"event: endpoint\ndata: /mcp/message?session_id={sid}\n\n"
             while True:
                 try:
