@@ -32,6 +32,7 @@ import websockets
 PORT = int(os.environ.get("PORT", "8000"))
 KISSTOY_WS = os.environ.get("KISSTOY_WS", "wss://api.app.knightjenay.cn/websocket-kisstoy")
 KISSTOY_API = os.environ.get("KISSTOY_API", "https://api.app.knightjenay.cn")
+DEFAULT_DEVICE_ID = os.environ.get("DEVICE_ID", "33")  # PLY5 = 19, override via env
 RATE_MAX = 120
 RATE_WINDOW = 60
 
@@ -119,16 +120,17 @@ async def health():
 
 
 class SessionInit(BaseModel):
-    device_id: str = "33"
+    device_id: str = DEFAULT_DEVICE_ID
     group: str = ""
     user_id: str = ""
     lang: str = "zh"
 
 
 @app.get("/api/test-upstream")
-async def test_upstream(group: str = Query(...), user_id: str = Query(default="")):
+async def test_upstream(group: str = Query(...), user_id: str = Query(default=""),
+                         device_id: str = Query(default=DEFAULT_DEVICE_ID)):
     """Diagnostic: test full upstream chain."""
-    result = {"group": group, "user_id": user_id}
+    result = {"group": group, "user_id": user_id, "device_id": device_id}
 
     # 1. Binding
     if user_id:
@@ -160,7 +162,7 @@ async def test_upstream(group: str = Query(...), user_id: str = Query(default=""
             "event": "control",
             "data": {
                 "target": group,
-                "device_id": "33",
+                "device_id": device_id,
                 "motors": {"1": 10}
             }
         })
