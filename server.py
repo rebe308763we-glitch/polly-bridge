@@ -202,7 +202,7 @@ async def become_controller(group: str = Query(...), session_id: str = Query(...
     except Exception as e:
         result["online_error"] = str(e)
 
-    # 3. Send test command
+    # 3. Send test pulse (on then off)
     try:
         test_cmd = json.dumps({
             "event": "control",
@@ -214,6 +214,17 @@ async def become_controller(group: str = Query(...), session_id: str = Query(...
         })
         await ws.send(test_cmd)
         result["test_command_sent"] = True
+        # Auto-stop after a brief pulse
+        await asyncio.sleep(0.5)
+        stop_cmd = json.dumps({
+            "event": "control",
+            "data": {
+                "target": group,
+                "device_id": device_id,
+                "motors": {"1": 0, "3": 0}
+            }
+        })
+        await ws.send(stop_cmd)
     except Exception as e:
         result["test_command_error"] = str(e)
 
