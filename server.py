@@ -585,8 +585,9 @@ async def mcp_get_token():
     }
 
 
-@app.get("/.well-known/oauth-protected-resource/{path:path}")
-async def oauth_resource_metadata(request: Request, path: str):
+# DISABLED: Don't advertise OAuth — SSE is open for personal use.
+# @app.get("/.well-known/oauth-protected-resource/{path:path}")
+async def _oauth_resource_metadata_disabled(request: Request, path: str):
     """OAuth 2.0 Protected Resource Metadata (RFC 9728) — tells Claude Chat how to auth."""
     base = str(request.base_url).rstrip("/")
     return {
@@ -597,8 +598,10 @@ async def oauth_resource_metadata(request: Request, path: str):
     }
 
 
-@app.get("/.well-known/oauth-authorization-server")
-async def oauth_discovery(request: Request):
+# DISABLED: Claude Chat discovers OAuth via this and insists on auth even when SSE is open.
+# Keep the /oauth/* endpoints functional but don't advertise them.
+# @app.get("/.well-known/oauth-authorization-server")
+async def _oauth_discovery_disabled(request: Request):
     """OAuth 2.0 Authorization Server Metadata (RFC 8414)."""
     base = str(request.base_url).rstrip("/")
     return {
