@@ -569,19 +569,102 @@ async def mcp_get_token():
     }
 
 
+@app.get("/.well-known/oauth-protected-resource/{path:path}")
+async def oauth_resource_metadata(request: Request, path: str):
+    """OAuth 2.0 Protected Resource Metadata (RFC 9728) — tells Claude Chat how to auth."""
+    base = str(request.base_url).rstrip("/")
+    return {
+        "resource": f"{base}/mcp/{path}",
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["mcp"],
+    }
+
+
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_discovery(request: Request):
     """OAuth 2.0 Authorization Server Metadata (RFC 8414)."""
     base = str(request.base_url).rstrip("/")
     return {
         "issuer": base,
-        "authorization_endpoint": f"{base}/mcp/authorize",
-        "token_endpoint": f"{base}/mcp/token",
-        "registration_endpoint": f"{base}/mcp/register",
+        "authorization_endpoint": f"{base}/oauth/authorize",
+        "token_endpoint": f"{base}/oauth/token",
+        "registration_endpoint": f"{base}/oauth/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": ["mcp"],
     }
+
+
+# ── /oauth/ aliases (Claude Chat expects these paths) ──────────────
+
+@app.post("/oauth/register")
+async def oauth_register_alias(request: Request):
+    """Alias for /mcp/register"""
+    body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+    client_name = body.get("client_name", "claude-chat")
+    redirect_uris = body.get("redirect_uris", ["http://localhost:0/callback"])
+    now_ts = int(time.time())
+    client_id = _hashlib.sha256(f"{client_name}:{_randhex(8)}".encode()).hexdigest()[:32]
+    client_secret = _randhex(24)
+    mcp_clients[client_id] = client_name
+    log.info(f"[OAuth] Registered: {client_id[:12]}... ({client_name})")
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_id_issued_at": now_ts,
+        "client_secret_expires_at": 0,
+        "client_name": client_name,
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+
+@app.get("/oauth/authorize")
+async def oauth_authorize_alias(
+    client_id: str = Query(...), redirect_uri: str = Query(...),
+    response_type: str = Query(default="code"), state: str = Query(default=""),
+    scope: str = Query(default=""), code_challenge: str = Query(default=""),
+    code_challenge_method: str = Query(default=""),
+):
+    code = _randhex(16)
+    mcp_auth_codes[code] = {"client_id": client_id, "redirect_uri": redirect_uri}
+    log.info(f"[OAuth] Auth code: {code[:12]}...")
+    sep = "&" if "?" in redirect_uri else "?"
+    redirect_url = f"{redirect_uri}{sep}code={code}"
+    if state: redirect_url += f"&state={state}"
+    from starlette.responses import RedirectResponse
+    return RedirectResponse(url=redirect_url, status_code=302)
+
+@app.post("/oauth/token")
+async def oauth_token_alias(request: Request):
+    try: body = await request.json()
+    except:
+        try: body = dict(await request.form())
+        except: return {"error": "invalid_request"}
+    grant_type = body.get("grant_type", "")
+    code = body.get("code", "")
+    client_id = body.get("client_id", "")
+    code_verifier = body.get("code_verifier", "")
+    if grant_type == "authorization_code":
+        auth = mcp_auth_codes.pop(code, None)
+        if not auth: return {"error": "invalid_grant"}
+        # Accept if client_id matches or if no client was specified
+        token = _randhex(24)
+        mcp_tokens[token] = {"client_id": auth.get("client_id", client_id), "created_at": time.time()}
+        log.info(f"[OAuth] Token issued")
+        return {"access_token": token, "token_type": "bearer", "expires_in": 86400}
+    elif grant_type == "refresh_token":
+        refresh = body.get("refresh_token", "")
+        old = mcp_tokens.pop(refresh, None)
+        if not old: return {"error": "invalid_grant"}
+        token = _randhex(24)
+        mcp_tokens[token] = old
+        return {"access_token": token, "token_type": "bearer", "expires_in": 86400}
+    return {"error": "unsupported_grant_type"}
 
 
 @app.post("/mcp/register")
@@ -691,22 +774,12 @@ async def mcp_sse(request: Request):
     # Debug: allow noauth=1 to bypass auth for testing
     noauth = request.query_params.get("noauth", "")
     if noauth != "1" and (not token or token not in mcp_tokens):
-        # Return OAuth metadata so Claude Chat knows where to register/authorize
+        # Return OAuth resource metadata (RFC 9728) — same pattern as Ombre Brain
         base = str(request.base_url).rstrip("/")
-        auth_meta = json.dumps({
-            "code": "UNAUTHORIZED",
-            "message": "Authentication required",
-            "data": {
-                "issuer": base,
-                "authorizationUrl": f"{base}/mcp/authorize",
-                "tokenUrl": f"{base}/mcp/token",
-                "registrationUrl": f"{base}/mcp/register",
-            }
-        })
-        async def auth_stream():
-            yield f"event: auth\ndata: {auth_meta}\n\n"
-        return StreamingResponse(auth_stream(), media_type="text/event-stream",
-                                  status_code=401)
+        return {
+            "error": "Unauthorized",
+            "resource_metadata": f"{base}/.well-known/oauth-protected-resource/mcp/sse"
+        }
 
     sid = uuid.uuid4().hex[:12]
     q: asyncio.Queue = asyncio.Queue()
