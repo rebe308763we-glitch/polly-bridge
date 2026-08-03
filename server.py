@@ -523,17 +523,24 @@ async def mcp_call_tool(name: str, arguments: dict) -> str:
     elif name == "polly_control":
         m1 = arguments.get("m1", 0)
         m3 = arguments.get("m3", 0)
+        # Quantize to 5 (same as REST API)
+        def _q(v): return 0 if v <= 0 else max(5, round(v / 5) * 5)
+        m1_q, m3_q = _q(m1), _q(m3)
         try:
             ws = await get_or_create_upstream(DEFAULT_GROUP)
+            motors = {}
+            if m1_q > 0: motors["1"] = m1_q
+            if m3_q > 0: motors["3"] = m3_q
+            if not motors: motors = {"1": 0, "3": 0}
             cmd = json.dumps({
                 "event": "control",
                 "data": {"target": DEFAULT_GROUP, "device_id": DEFAULT_DEVICE_ID,
-                         "motors": {"1": m1, "3": m3}}
+                         "motors": motors}
             })
             await ws.send(cmd)
             parts = []
-            if m1 > 0: parts.append(f"震动 {m1}%")
-            if m3 > 0: parts.append(f"吮吸 {m3}%")
+            if m1_q > 0: parts.append(f"震动 {m1_q}%")
+            if m3_q > 0: parts.append(f"吮吸 {m3_q}%")
             return json.dumps({"status": "ok", "message": " + ".join(parts) if parts else "已停止"},
                               ensure_ascii=False)
         except Exception as e:
