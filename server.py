@@ -551,6 +551,21 @@ async def mcp_sse_event(sid: str, data: str):
 
 # ── OAuth Endpoints ───────────────────────────────────────────────
 
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_discovery(request: Request):
+    """OAuth 2.0 Authorization Server Metadata (RFC 8414)."""
+    base = str(request.base_url).rstrip("/")
+    return {
+        "issuer": base,
+        "authorization_endpoint": f"{base}/mcp/authorize",
+        "token_endpoint": f"{base}/mcp/token",
+        "registration_endpoint": f"{base}/mcp/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    }
+
+
 @app.post("/mcp/register")
 async def mcp_register(request: Request):
     """Dynamic Client Registration — Claude Chat registers here."""
@@ -562,11 +577,16 @@ async def mcp_register(request: Request):
         client_name = "claude-chat"
         redirect_uris = ["http://localhost:0/callback"]
 
+    now_ts = int(time.time())
     client_id = _hashlib.sha256(f"{client_name}:{_randhex(8)}".encode()).hexdigest()[:32]
+    client_secret = _randhex(24)
     mcp_clients[client_id] = client_name
     log.info(f"[MCP-OAuth] Registered client: {client_id[:12]}... ({client_name})")
     return {
         "client_id": client_id,
+        "client_secret": client_secret,
+        "client_id_issued_at": now_ts,
+        "client_secret_expires_at": 0,  # never expires
         "client_name": client_name,
         "redirect_uris": redirect_uris,
         "grant_types": ["authorization_code", "refresh_token"],
@@ -653,9 +673,20 @@ async def mcp_sse(request: Request):
         token = request.query_params.get("token", "")
 
     if not token or token not in mcp_tokens:
-        # Return auth required
+        # Return OAuth metadata so Claude Chat knows where to register/authorize
+        base = str(request.base_url).rstrip("/")
+        auth_meta = json.dumps({
+            "code": "UNAUTHORIZED",
+            "message": "Authentication required",
+            "data": {
+                "issuer": base,
+                "authorizationUrl": f"{base}/mcp/authorize",
+                "tokenUrl": f"{base}/mcp/token",
+                "registrationUrl": f"{base}/mcp/register",
+            }
+        })
         async def auth_stream():
-            yield f"event: auth\ndata: {{\"code\":\"UNAUTHORIZED\",\"message\":\"Authentication required. Use /mcp/register and /mcp/authorize to get a token.\"}}\n\n"
+            yield f"event: auth\ndata: {auth_meta}\n\n"
         return StreamingResponse(auth_stream(), media_type="text/event-stream",
                                   status_code=401)
 
