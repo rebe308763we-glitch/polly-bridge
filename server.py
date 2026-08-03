@@ -78,8 +78,8 @@ def call_binding(user_id: str):
         return None
 
 
-async def get_or_create_upstream(group: str, user_id: str = ""):
-    """Create upstream to KissToy WebSocket. URL: ?group=GROUP only (no id)."""
+async def get_or_create_upstream(group: str, user_id: str = "", skip_binding: bool = False):
+    """Create upstream to KissToy WebSocket. pass user_id to become controller."""
     ws = group_upstreams.get(group)
     needs_new = ws is None
     if not needs_new:
@@ -88,8 +88,8 @@ async def get_or_create_upstream(group: str, user_id: str = ""):
         except Exception:
             needs_new = True
     if needs_new:
-        # Call binding first if user_id provided
-        if user_id:
+        # HTTP binding (optional — browser may do this via WS instead)
+        if user_id and not skip_binding:
             call_binding(user_id)
 
         ws_url = f"{KISSTOY_WS}?group={group}&id={user_id}" if user_id else f"{KISSTOY_WS}?group={group}"
@@ -157,6 +157,52 @@ async def test_upstream(group: str = Query(...), user_id: str = Query(default=""
         result["online_error"] = str(e)
 
     # 4. Send a test command
+    try:
+        test_cmd = json.dumps({
+            "event": "control",
+            "data": {
+                "target": group,
+                "device_id": device_id,
+                "motors": {"1": 10}
+            }
+        })
+        await ws.send(test_cmd)
+        result["test_command_sent"] = True
+    except Exception as e:
+        result["test_command_error"] = str(e)
+
+    return result
+
+
+@app.get("/api/become-controller")
+async def become_controller(group: str = Query(...), session_id: str = Query(...),
+                             device_id: str = Query(default=DEFAULT_DEVICE_ID)):
+    """Try to become the controller by connecting WS with session_id, no HTTP binding.
+    This tests whether the WS connection itself (with a fresh session id) is enough
+    to create the master session, without needing the browser's HTTP binding call."""
+    result = {"group": group, "session_id": session_id, "device_id": device_id,
+              "approach": "WS with session_id, NO HTTP binding"}
+
+    # 1. Connect WS with session_id, skip HTTP binding
+    try:
+        ws = await get_or_create_upstream(group, session_id, skip_binding=True)
+        result["ws_connected"] = True
+        result["ws_remote"] = str(ws.remote_address) if hasattr(ws, 'remote_address') else "?"
+    except Exception as e:
+        result["ws_connected"] = False
+        result["ws_error"] = str(e)
+        return result
+
+    # 2. Check online status
+    try:
+        await ws.send(json.dumps({"event": "online_status", "data": {"group": group}}))
+        import asyncio as _asyncio
+        resp = await _asyncio.wait_for(ws.recv(), timeout=5)
+        result["online_response"] = json.loads(resp)
+    except Exception as e:
+        result["online_error"] = str(e)
+
+    # 3. Send test command
     try:
         test_cmd = json.dumps({
             "event": "control",
