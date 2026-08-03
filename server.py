@@ -476,7 +476,8 @@ MCP_REDIRECT_URI = os.environ.get("MCP_REDIRECT_URI", "http://localhost:0/callba
 log.info(f"[MCP-OAuth] client_id={MCP_CLIENT_ID}")
 
 # Pre-generated static token — use with ?token=... to skip OAuth
-MCP_STATIC_TOKEN = os.environ.get("MCP_POLLY_TOKEN", _randhex(24))
+# Set MCP_POLLY_TOKEN env var on Render to make it persistent across deploys
+MCP_STATIC_TOKEN = os.environ.get("MCP_POLLY_TOKEN", "polly-static-token-v1")
 mcp_tokens[MCP_STATIC_TOKEN] = {"client_id": "static", "created_at": time.time()}
 log.info(f"[MCP-OAuth] Static token: {MCP_STATIC_TOKEN[:12]}... (use ?token= in URL)")
 
