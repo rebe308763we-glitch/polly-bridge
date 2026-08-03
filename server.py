@@ -220,6 +220,56 @@ async def become_controller(group: str = Query(...), session_id: str = Query(...
     return result
 
 
+class MotorCommand(BaseModel):
+    group: str = ""
+    device_id: str = DEFAULT_DEVICE_ID
+    motor1: int = 0   # vibration 0-100 (quantized to 5)
+    motor3: int = 0   # suction 0-100 (quantized to 5)
+
+
+@app.post("/api/command")
+@app.get("/api/command")
+async def send_command(group: str = Query(...), device_id: str = Query(default=DEFAULT_DEVICE_ID),
+                        m1: int = Query(default=0), m3: int = Query(default=0)):
+    """Send a motor command. Use this from Claude/any HTTP client.
+    GET /api/command?group=...&m1=60&m3=0  →  vibration 60, suction 0
+    GET /api/command?group=...&m1=0&m3=0   →  stop all"""
+    result = {"group": group, "device_id": device_id, "motors": {}}
+
+    # Quantize to 5
+    def q(v):
+        if v <= 0: return 0
+        return max(5, round(v / 5) * 5)
+
+    motors = {}
+    m1_val = q(m1)
+    m3_val = q(m3)
+    if m1_val > 0 or m3_val > 0 or (m1 == 0 and m3 == 0):
+        motors["1"] = m1_val
+        motors["3"] = m3_val
+    result["motors"] = motors
+
+    try:
+        ws = await get_or_create_upstream(group)
+    except Exception as e:
+        result["error"] = f"Upstream failed: {e}"
+        return result
+
+    try:
+        cmd = json.dumps({
+            "event": "control",
+            "data": {"target": group, "device_id": device_id, "motors": motors}
+        })
+        await ws.send(cmd)
+        result["sent"] = True
+    except Exception as e:
+        group_upstreams.pop(group, None)
+        result["error"] = f"Send failed: {e}"
+        result["sent"] = False
+
+    return result
+
+
 @app.post("/api/session/init")
 async def init_session(s: SessionInit, request: Request):
     host = request.headers.get("host", "localhost")
