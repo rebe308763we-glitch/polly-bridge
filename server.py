@@ -467,6 +467,11 @@ MCP_REDIRECT_URI = os.environ.get("MCP_REDIRECT_URI", "http://localhost:0/callba
 
 log.info(f"[MCP-OAuth] client_id={MCP_CLIENT_ID}")
 
+# Pre-generated static token — use with ?token=... to skip OAuth
+MCP_STATIC_TOKEN = os.environ.get("MCP_POLLY_TOKEN", _randhex(24))
+mcp_tokens[MCP_STATIC_TOKEN] = {"client_id": "static", "created_at": time.time()}
+log.info(f"[MCP-OAuth] Static token: {MCP_STATIC_TOKEN[:12]}... (use ?token= in URL)")
+
 MCP_TOOLS = [
     {
         "name": "polly_init",
@@ -550,6 +555,19 @@ async def mcp_sse_event(sid: str, data: str):
 
 
 # ── OAuth Endpoints ───────────────────────────────────────────────
+
+@app.get("/mcp/get-token")
+async def mcp_get_token():
+    """Generate a permanent token for simple auth (no OAuth needed)."""
+    token = _randhex(24)
+    mcp_tokens[token] = {"client_id": "manual", "created_at": time.time()}
+    log.info(f"[MCP-OAuth] Manual token generated: {token[:12]}...")
+    return {
+        "token": token,
+        "usage": f"https://polly-bridge.onrender.com/mcp/sse?token={token}",
+        "note": "Add this to Claude Chat MCP Server URL. No OAuth needed."
+    }
+
 
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_discovery(request: Request):
