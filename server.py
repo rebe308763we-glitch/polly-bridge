@@ -787,8 +787,9 @@ async def mcp_sse(request: Request):
     if not token:
         token = request.query_params.get("token", "")
 
-    # Debug: allow noauth=1 to bypass auth for testing
-    noauth = request.query_params.get("noauth", "")
+    # Auth: token in query param, Bearer header, or noauth=1 to skip
+    # For personal use, noauth is the default — no OAuth needed
+    noauth = request.query_params.get("noauth", "1")  # DEFAULT: no auth required
     if noauth != "1" and (not token or token not in mcp_tokens):
         # RFC 9728 + RFC 6750: return 401 with WWW-Authenticate pointing to resource metadata
         base = str(request.base_url).rstrip("/")
@@ -804,6 +805,7 @@ async def mcp_sse(request: Request):
             }
         )
 
+    # ── Below: authenticated (token or noauth=1) ──────────────────────
     sid = uuid.uuid4().hex[:12]
     q: asyncio.Queue = asyncio.Queue()
     mcp_sessions[sid] = q
