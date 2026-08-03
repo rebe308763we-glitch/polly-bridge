@@ -22,10 +22,11 @@ import urllib.request
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
+import uuid
 import websockets
 
 # ── Config ──────────────────────────────────────────────────────────
@@ -33,6 +34,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 KISSTOY_WS = os.environ.get("KISSTOY_WS", "wss://api.app.knightjenay.cn/websocket-kisstoy")
 KISSTOY_API = os.environ.get("KISSTOY_API", "https://api.app.knightjenay.cn")
 DEFAULT_DEVICE_ID = os.environ.get("DEVICE_ID", "33")  # PLY5 = 19, override via env
+DEFAULT_GROUP = os.environ.get("POLLY_GROUP", "82e0ff7c8e3dabe932332e6ea65d272d")
 RATE_MAX = 120
 RATE_WINDOW = 60
 
@@ -446,6 +448,155 @@ async def start_keepalive():
                 except Exception:
                     group_upstreams.pop(group, None)
     asyncio.create_task(keepalive())
+
+
+# ── MCP SSE (for Claude Chat mobile/desktop) ─────────────────────────
+mcp_sessions: dict[str, asyncio.Queue] = {}
+
+MCP_TOOLS = [
+    {
+        "name": "polly_init",
+        "description": "接管 Polly 设备主控权。需传入 KissToy 分享链接中的 session_id（id= 后面的值）。获取主控权后即可用 polly_control 控制设备。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"session_id": {"type": "string", "description": "KissToy 分享链接中 id= 的值"}},
+            "required": ["session_id"]
+        }
+    },
+    {
+        "name": "polly_control",
+        "description": "控制 Polly 设备的电机。m1 为震动 0-100，m3 为吮吸 0-100，按 5 取整。都为 0 时停止。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "m1": {"type": "integer", "description": "震动强度 0-100", "minimum": 0, "maximum": 100},
+                "m3": {"type": "integer", "description": "吮吸强度 0-100", "minimum": 0, "maximum": 100}
+            },
+            "required": ["m1", "m3"]
+        }
+    },
+    {
+        "name": "polly_stop",
+        "description": "紧急停止 — 立即关闭 Polly 所有电机。",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+]
+
+
+async def mcp_call_tool(name: str, arguments: dict) -> str:
+    """Execute MCP tool call using internal functions."""
+    if name == "polly_init":
+        try:
+            ws = await get_or_create_upstream(DEFAULT_GROUP, arguments["session_id"], skip_binding=True)
+            return json.dumps({"status": "ok", "message": "主控权已接管，设备就绪！",
+                               "ws": str(ws.remote_address)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "failed", "message": f"接管失败: {e}"}, ensure_ascii=False)
+
+    elif name == "polly_control":
+        m1 = arguments.get("m1", 0)
+        m3 = arguments.get("m3", 0)
+        try:
+            ws = await get_or_create_upstream(DEFAULT_GROUP)
+            cmd = json.dumps({
+                "event": "control",
+                "data": {"target": DEFAULT_GROUP, "device_id": DEFAULT_DEVICE_ID,
+                         "motors": {"1": m1, "3": m3}}
+            })
+            await ws.send(cmd)
+            parts = []
+            if m1 > 0: parts.append(f"震动 {m1}%")
+            if m3 > 0: parts.append(f"吮吸 {m3}%")
+            return json.dumps({"status": "ok", "message": " + ".join(parts) if parts else "已停止"},
+                              ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "failed", "message": f"发送失败: {e}"}, ensure_ascii=False)
+
+    elif name == "polly_stop":
+        try:
+            ws = await get_or_create_upstream(DEFAULT_GROUP)
+            cmd = json.dumps({
+                "event": "control",
+                "data": {"target": DEFAULT_GROUP, "device_id": DEFAULT_DEVICE_ID,
+                         "motors": {"1": 0, "3": 0}}
+            })
+            await ws.send(cmd)
+            return json.dumps({"status": "ok", "message": "所有电机已停止"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "failed", "message": f"停止失败: {e}"}, ensure_ascii=False)
+
+    return json.dumps({"error": f"Unknown tool: {name}"})
+
+
+async def mcp_sse_event(sid: str, data: str):
+    """Push an SSE event to a session."""
+    q = mcp_sessions.get(sid)
+    if q:
+        await q.put(data)
+
+
+@app.get("/mcp/sse")
+async def mcp_sse(request: Request):
+    """SSE endpoint for Claude Chat MCP connection."""
+    sid = uuid.uuid4().hex[:12]
+    q: asyncio.Queue = asyncio.Queue()
+    mcp_sessions[sid] = q
+    log.info(f"[MCP-SSE] Client connected: {sid}")
+
+    async def event_stream():
+        try:
+            # Send endpoint URL for this session
+            yield f"event: endpoint\ndata: /mcp/message?session_id={sid}\n\n"
+            while True:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=30)
+                    yield f"event: message\ndata: {data}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            mcp_sessions.pop(sid, None)
+            log.info(f"[MCP-SSE] Client disconnected: {sid}")
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/mcp/message")
+async def mcp_message(request: Request, session_id: str = Query(...)):
+    """Receive JSON-RPC messages from Claude Chat MCP client."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"error": "Invalid JSON"}
+
+    method = body.get("method", "")
+    req_id = body.get("id")
+    params = body.get("params", {})
+
+    log.info(f"[MCP-MSG] sid={session_id[:8]}... method={method}")
+
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "polly-bridge", "version": "0.5.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": MCP_TOOLS}
+    elif method == "tools/call":
+        tool_name = params.get("name", "")
+        arguments = params.get("arguments", {})
+        text = await mcp_call_tool(tool_name, arguments)
+        result = {"content": [{"type": "text", "text": text}]}
+    elif method == "notifications/initialized":
+        return {}  # No response
+    else:
+        result = {"error": {"code": -32601, "message": f"Unknown method: {method}"}}
+
+    response = {"jsonrpc": "2.0", "id": req_id, "result": result}
+    await mcp_sse_event(session_id, json.dumps(response))
+    return {"status": "ok"}
 
 
 # ── Static ──────────────────────────────────────────────────────────
