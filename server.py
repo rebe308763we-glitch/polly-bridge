@@ -80,8 +80,16 @@ def call_binding(user_id: str):
         return None
 
 
-async def get_or_create_upstream(group: str, user_id: str = "", skip_binding: bool = False):
-    """Create upstream to KissToy WebSocket. pass user_id to become controller."""
+async def get_or_create_upstream(group: str, user_id: str = "", skip_binding: bool = False, force: bool = False):
+    """Create upstream to KissToy WebSocket. pass user_id to become controller.
+    Set force=True to disconnect existing WS and create a fresh one (for polly_init)."""
+    if force:
+        old = group_upstreams.pop(group, None)
+        if old:
+            try: await old.close()
+            except Exception: pass
+            log.info(f"[Upstream] Force-closed old connection for group {group[:12]}...")
+
     ws = group_upstreams.get(group)
     needs_new = ws is None
     if not needs_new:
@@ -506,7 +514,7 @@ async def mcp_call_tool(name: str, arguments: dict) -> str:
     """Execute MCP tool call using internal functions."""
     if name == "polly_init":
         try:
-            ws = await get_or_create_upstream(DEFAULT_GROUP, arguments["session_id"], skip_binding=True)
+            ws = await get_or_create_upstream(DEFAULT_GROUP, arguments["session_id"], skip_binding=True, force=True)
             return json.dumps({"status": "ok", "message": "主控权已接管，设备就绪！",
                                "ws": str(ws.remote_address)}, ensure_ascii=False)
         except Exception as e:
@@ -774,12 +782,19 @@ async def mcp_sse(request: Request):
     # Debug: allow noauth=1 to bypass auth for testing
     noauth = request.query_params.get("noauth", "")
     if noauth != "1" and (not token or token not in mcp_tokens):
-        # Return OAuth resource metadata (RFC 9728) — same pattern as Ombre Brain
+        # RFC 9728 + RFC 6750: return 401 with WWW-Authenticate pointing to resource metadata
         base = str(request.base_url).rstrip("/")
-        return {
-            "error": "Unauthorized",
-            "resource_metadata": f"{base}/.well-known/oauth-protected-resource/mcp/sse"
-        }
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "Unauthorized",
+                "resource_metadata": f"{base}/.well-known/oauth-protected-resource/mcp/sse"
+            },
+            headers={
+                "WWW-Authenticate": f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/mcp/sse"'
+            }
+        )
 
     sid = uuid.uuid4().hex[:12]
     q: asyncio.Queue = asyncio.Queue()
