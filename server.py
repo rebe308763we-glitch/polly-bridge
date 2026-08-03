@@ -96,7 +96,7 @@ async def get_or_create_upstream(group: str, user_id: str = ""):
         log.info(f"[Upstream] Connecting: {ws_url}")
         ws = await websockets.connect(
             ws_url, ping_interval=None, open_timeout=15,
-            extra_headers={
+            additional_headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Origin": "https://api.app.knightjenay.cn",
             },

@@ -78,7 +78,7 @@ async def main():
             kisstoy_ws = await websockets.connect(
                 kisstoy_url,
                 ping_interval=None,
-                extra_headers={
+                additional_headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Origin": "https://api.app.knightjenay.cn",
                 },
